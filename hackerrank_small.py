@@ -209,16 +209,18 @@ MAX_QUOTE_SIZE = 40
 INVENTORY_SIZE_SHRINK = 0.25
 GAMMA_AVERSION = 0.0
 GAMMA_PAD_AVERSION = 0.25
-MAX_GAMMA_PAD = 0.04
-GAMMA_SIZE_TOLERANCE = 0.02
+MAX_GAMMA_PAD = 0.015
+GAMMA_SIZE_TOLERANCE = 0.1
 COMPANY_LOG_BUMP = 0.01
 VOL_RELATIVE_UNCERTAINTY = 0.1
 MIN_VOL_RELATIVE_UNCERTAINTY = 0.05
 MAX_VOL_RELATIVE_UNCERTAINTY = 0.5
 COVARIANCE_BUMP = 0.1
 VEGA_PAD_AVERSION = 1.0
-MAX_VEGA_PAD = 0.04
-VEGA_SIZE_TOLERANCE = 0.005
+MAX_VEGA_PAD = 0.01
+VEGA_SIZE_TOLERANCE = 0.025
+MAX_MODEL_PADDING = 0.012
+MIN_SIZE_FACTOR = 0.25
 REFIT_INTERVAL_STEPS = 5
 MIN_REFIT_OBSERVATIONS = 30
 CONCURRENT_LOAD_FACTOR = 2.5
@@ -799,6 +801,13 @@ class MarketMaker:
             return 1.0
         return 1.0 / (1.0 + self._convexity_charge(option) / GAMMA_SIZE_TOLERANCE)
 
+    def _model_padding(self, option):
+        return min(self._convexity_padding(option) + self._vol_uncertainty_padding(option), MAX_MODEL_PADDING)
+
+    def _model_size_factor(self, option):
+        combined = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
+        return min(max(combined, MIN_SIZE_FACTOR), 1.0)
+
     def reservation_price(self, option):
         return min(max(self._price_option_strict(option) - self._inventory_skew(option), 0.0), 1.0)
 
@@ -849,7 +858,7 @@ class MarketMaker:
             return MarketMaker.DECLINE_QUOTE
 
     def _quote(self, option, counterparty_id):
-        padding = WINNER_CURSE_PAD + self._counterparty_padding(counterparty_id) + self._convexity_padding(option) + self._vol_uncertainty_padding(option)
+        padding = WINNER_CURSE_PAD + self._counterparty_padding(counterparty_id) + self._model_padding(option)
         skew = self._inventory_skew(option)
         reservation = self.reservation_price(option)
         raw_bid, raw_offer = self._collateral_quote_prices(reservation, option.steps_until_expiry, padding)
@@ -857,7 +866,7 @@ class MarketMaker:
         steps = option.steps_until_expiry
         bid_quantity = self._affordable_quantity(bid_price, steps)
         offer_quantity = self._affordable_quantity(1.0 - offer_price, steps)
-        size_factor = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
+        size_factor = self._model_size_factor(option)
         bid_quantity = _shrink_quantity(bid_quantity, size_factor)
         offer_quantity = _shrink_quantity(offer_quantity, size_factor)
         if skew > 0.0:
@@ -880,7 +889,7 @@ class MarketMaker:
 
     def _respond_to_fok(self, option, fok_order):
         reservation = self.reservation_price(option)
-        required = FOK_EDGE_REQUIRED + self._counterparty_padding(fok_order.counterparty_id) + self._convexity_padding(option) + self._vol_uncertainty_padding(option)
+        required = FOK_EDGE_REQUIRED + self._counterparty_padding(fok_order.counterparty_id) + self._model_padding(option)
         probing = not self._order_type_side_confirmed and self._fok_side_agreements + self._fok_side_disagreements < FOK_SIDE_CONFIRMING_TRADES
         if probing:
             required *= FOK_PROBE_EDGE_MULTIPLIER

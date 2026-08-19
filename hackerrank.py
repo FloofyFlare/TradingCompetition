@@ -286,8 +286,8 @@ INVENTORY_SIZE_SHRINK: Final[float] = 0.25
 # because the risk it describes is not directional. Left as one number to flip if that changes.
 GAMMA_AVERSION: Final[float] = 0.0
 GAMMA_PAD_AVERSION: Final[float] = 0.25
-MAX_GAMMA_PAD: Final[float] = 0.04
-GAMMA_SIZE_TOLERANCE: Final[float] = 0.02
+MAX_GAMMA_PAD: Final[float] = 0.015
+GAMMA_SIZE_TOLERANCE: Final[float] = 0.10
 # Bump used for the company log-value derivatives. Small against a per-step sigma of ~0.10, so
 # the second difference resolves real curvature rather than the shape of the whole distribution.
 COMPANY_LOG_BUMP: Final[float] = 0.01
@@ -311,8 +311,27 @@ MIN_VOL_RELATIVE_UNCERTAINTY: Final[float] = 0.05
 MAX_VOL_RELATIVE_UNCERTAINTY: Final[float] = 0.50
 COVARIANCE_BUMP: Final[float] = 0.10
 VEGA_PAD_AVERSION: Final[float] = 1.0
-MAX_VEGA_PAD: Final[float] = 0.04
-VEGA_SIZE_TOLERANCE: Final[float] = 0.005
+MAX_VEGA_PAD: Final[float] = 0.010
+VEGA_SIZE_TOLERANCE: Final[float] = 0.025
+
+# Hard ceiling on everything the *model* charges for -- convexity plus vol uncertainty. The two
+# individual caps above are not enough on their own, because both saturate simultaneously on
+# exactly the contract that trades most: short-dated and near the strike.
+#
+# The knobs above were originally calibrated against a simulated market with ~0.10 of vol per
+# step. The real one runs at 0.010 to 0.031, backed out of the graded theos. Gamma scales as
+# 1/sigma^2, so it arrives 10 to 70 times larger than anything they were tuned for: a 1-day
+# near-money binary showed gamma of -1140, which saturated both pads and collapsed the size
+# factor to 0.08. The first live run quoted that contract 0.67 / 0.81 in size 1 -- fourteen
+# cents wide against a Fixed Width competitor showing five, so it won nothing and scored 0.00.
+#
+# Capping the sum, rather than chasing the individual knobs, is what makes this robust to a vol
+# regime we cannot observe in advance. Adverse-selection charges (winner's curse, and the
+# per-counterparty markup) sit outside the cap, since those are evidence rather than model risk.
+MAX_MODEL_PADDING: Final[float] = 0.012
+# Floor under the combined convexity/vol size multiplier, for the same reason: a contract whose
+# curvature is merely normal for this market must not be shrunk to nothing.
+MIN_SIZE_FACTOR: Final[float] = 0.25
 
 # Online re-estimation. The warm-up is whatever the grader hands us, and price error is brutally
 # sensitive to its length (measured: mean 0.114 at 30 days, 0.075 at 60, 0.026 at 400 -- against
@@ -1405,6 +1424,19 @@ class MarketMaker:
             return 1.0
         return 1.0 / (1.0 + self._convexity_charge(option) / GAMMA_SIZE_TOLERANCE)
 
+
+    def _model_padding(self, option: BinaryOption) -> float:
+        """Convexity plus vol-uncertainty charge, capped in total. See `MAX_MODEL_PADDING`."""
+        return min(
+            self._convexity_padding(option) + self._vol_uncertainty_padding(option),
+            MAX_MODEL_PADDING,
+        )
+
+    def _model_size_factor(self, option: BinaryOption) -> float:
+        """Combined convexity/vol size multiplier, floored. See `MIN_SIZE_FACTOR`."""
+        combined: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
+        return min(max(combined, MIN_SIZE_FACTOR), 1.0)
+
     def reservation_price(self, option: BinaryOption) -> float:
         """Theo adjusted for the delta we already hold -- the price we actually trade around.
 
@@ -1514,8 +1546,7 @@ class MarketMaker:
         padding: float = (
             WINNER_CURSE_PAD
             + self._counterparty_padding(counterparty_id)
-            + self._convexity_padding(option)
-            + self._vol_uncertainty_padding(option)
+            + self._model_padding(option)
         )
         skew: float = self._inventory_skew(option)
         reservation: float = self.reservation_price(option)
@@ -1529,7 +1560,7 @@ class MarketMaker:
 
         # Curvature cuts both sides: unlike inventory skew this is not directional, it is a
         # statement that our own delta snapshot is about to be wrong whichever way we get hit.
-        size_factor: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
+        size_factor: float = self._model_size_factor(option)
         bid_quantity = _shrink_quantity(bid_quantity, size_factor)
         offer_quantity = _shrink_quantity(offer_quantity, size_factor)
 
@@ -1572,8 +1603,7 @@ class MarketMaker:
         required: float = (
             FOK_EDGE_REQUIRED
             + self._counterparty_padding(fok_order.counterparty_id)
-            + self._convexity_padding(option)
-            + self._vol_uncertainty_padding(option)
+            + self._model_padding(option)
         )
 
         # Until the tape has confirmed what `order_type` means, treat every FOK as a probe:
