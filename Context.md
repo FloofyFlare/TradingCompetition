@@ -100,6 +100,7 @@ Each option pays out 1.0 at expiry if the event occurs otherwise it is 0.0
 examples include FED rate greater than or equal to 3.0 in 3 days
 THR valuation is greater than 1tn in 5 days
 AJR valuation greater than or equal to THR in 2 days
+Not that although the Binary Otpion class can represent options with any amount of leges. in practice you will only encounter single-legged options, or "spreads" on whether AJR or THR has a higher valuation like the third example above 
 
 There are two distinct pipelines RFQ (request-for-quote), the exchange will request quotes from all participating market makers, and route the order to the highest bid or lowest offer it receives, splitting up the order if necessary. Therefore, your quote method should return the most competitive prices and quantities you are able to trade on. Note that you will not know ahead of time whether the RFQ is a buy or sell order. FOK orders give you all the informatio nup front, and it is up to you whether you wnat to trade them, via your return value from `respond_to_fok`. If multiple market makers denot that they want to trade an FOK order, it will be broken up between them.
 
@@ -112,3 +113,4 @@ Score will vary based on PnL zero credit for going bankrupt and session will end
 The tests will vary in difficulty, including via different counterparities and different competing market makers.
 
 Bankruptcy: The autograder will keep track of cash balance, separate of the balancy you may store on the MarketMaker. Every time you do a trade, your balanmce will decrease by the maximum loss of your trade. So if you buy 5 contracts for $0.20 each, your cassh balance will go down by a dollar: if you sell 5 contracts at $0.20 apiece, your cash balance will go down by $4. Cash solvency is checked at the end of each day. First, any payoffs associated with expired options will be credited - note that this process can only increase your balanace, At this point in fyour cash balance is below zero, you will be marked as bankrupt, and the session will end early.
+

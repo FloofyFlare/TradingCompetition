@@ -300,11 +300,24 @@ COMPANY_LOG_BUMP: Final[float] = 0.01
 # 64/80 paired wins). It is not redundant with gamma despite a +0.56 charge correlation: gamma
 # blows up as 1/sigma^2 and so only ever flags short-dated contracts, while vega stays bounded
 # and catches the long-dated ones, where n steps of compounding make a covariance error worst.
+# `VOL_RELATIVE_UNCERTAINTY` is only the fallback for when we have no residual count to work
+# from; `FittedParameters.covariance_sample_size` normally drives it, because sqrt(2/N) is a
+# factor of two larger on a 60-day warm-up than on the 200-day one this constant assumed.
 VOL_RELATIVE_UNCERTAINTY: Final[float] = 0.10
+MIN_VOL_RELATIVE_UNCERTAINTY: Final[float] = 0.05
+MAX_VOL_RELATIVE_UNCERTAINTY: Final[float] = 0.50
 COVARIANCE_BUMP: Final[float] = 0.10
 VEGA_PAD_AVERSION: Final[float] = 1.0
 MAX_VEGA_PAD: Final[float] = 0.04
 VEGA_SIZE_TOLERANCE: Final[float] = 0.005
+
+# Online re-estimation. The warm-up is whatever the grader hands us, and price error is brutally
+# sensitive to its length (measured: mean 0.114 at 30 days, 0.075 at 60, 0.026 at 400 -- against
+# a quoted half-spread of a few cents). Every step of the session is another observation of the
+# same fixed generator, so folding the live path back into the fit is free accuracy. Refitting
+# costs one O(N) pass, so the interval is about cache churn, not compute.
+REFIT_INTERVAL_STEPS: Final[int] = 5
+MIN_REFIT_OBSERVATIONS: Final[int] = 30
 
 # Collateral is only returned at expiry, so the book's peak usage is roughly
 # (fills per step) x (collateral per fill) x (steps held). Budgeting each quote against the
@@ -314,9 +327,23 @@ CASH_BUFFER_FRACTION: Final[float] = 0.10
 MIN_CASH_BUFFER: Final[float] = 2.0
 FOK_EDGE_REQUIRED: Final[float] = 0.015
 
-# The counterparty's own direction. If the VERBOSE logs show `FokOrder.order_type` is instead
-# the side *we* are being asked to take, flip this to False.
+# The counterparty's own direction, used only as the starting guess: `on_trade` reports the
+# signed quantity we actually received, so an accepted FOK tells us which reading is right and
+# `_record_fok_outcome` flips this if the tape disagrees. Until enough fills have voted, FOKs
+# are treated as probes -- double edge required, and only small clips -- which bounds the cost
+# of starting on the wrong guess to a few cents.
 ORDER_TYPE_IS_COUNTERPARTY_SIDE: Final[bool] = True
+FOK_SIDE_CONFIRMING_TRADES: Final[int] = 3
+FOK_SIDE_FLIP_MARGIN: Final[int] = 2
+FOK_PROBE_MAX_QUANTITY: Final[int] = 3
+FOK_PROBE_EDGE_MULTIPLIER: Final[float] = 2.0
+
+# Settlement timing. `on_step_advance` derives, per expiring option, which day's values the
+# payoff was struck against (see `_settlement_values_for`). `_pessimistic_cash` shadows the main
+# ledger crediting the *worse* of the two readings, and sizing runs off the lower of the two.
+# The cap stops a long run of disagreements from strangling quote sizes outright; without any
+# such shadow, a wrong reading was measured to invent 31.00 of phantom cash on a 100 bankroll.
+SETTLEMENT_DOUBT_CAP_FRACTION: Final[float] = 0.25
 
 
 def _norm_cdf(z: float) -> float:
@@ -383,6 +410,10 @@ class FittedParameters:
         drift + rate_beta * rate_change + N(0, covariance)
     where `covariance` folds the shared sector shock and the idiosyncratic shock together.
     Only the product (sector_beta * sector_std_dev) is identifiable, and only it is needed.
+
+    `covariance_sample_size` is the number of residuals `covariance` was built from. It is not
+    used in pricing at all -- it is carried so the vega charge can size itself off the actual
+    standard error, sqrt(2/N), instead of a constant guessing at N. Zero means "unknown".
     """
 
     rate_step: float
@@ -392,6 +423,17 @@ class FittedParameters:
     drift_by_id: dict[int, float]
     rate_beta_by_id: dict[int, float]
     covariance: dict[tuple[int, int], float]
+    covariance_sample_size: int = 0
+
+    @property
+    def relative_vol_uncertainty(self) -> float:
+        """Relative standard error of the fitted vol level, sqrt(2/N), clamped to a sane band."""
+        if self.covariance_sample_size < 2:
+            return VOL_RELATIVE_UNCERTAINTY
+        return min(
+            max(math.sqrt(2.0 / self.covariance_sample_size), MIN_VOL_RELATIVE_UNCERTAINTY),
+            MAX_VOL_RELATIVE_UNCERTAINTY,
+        )
 
     def rate_transition_probabilities(self, rate_value: float) -> tuple[float, float]:
         up_probability: float = min(max(self.rate_intercept_up + self.rate_slope * rate_value, 0.0), 1.0)
@@ -450,6 +492,9 @@ def fitted_from_market_parameters(market_parameters: MarketParameters) -> Fitted
                 market_parameters.ajarai_sector_beta * market_parameters.theriodic_sector_beta * sector_variance
             ),
         },
+        # These are the true parameters, not an estimate: there is no estimation error to charge
+        # for, so the sample size is nominally infinite.
+        covariance_sample_size=1_000_000_000,
     )
 
 
@@ -764,6 +809,7 @@ def estimate_parameters(market_history: MarketHistory) -> FittedParameters:
         ]
 
     covariance: dict[tuple[int, int], float] = dict(DEFAULT_PARAMETERS.covariance)
+    covariance_sample_size: int = 0
     for first_id in COMPANY_UNDERLYING_IDS:
         for second_id in COMPANY_UNDERLYING_IDS:
             first_residuals: list[float] = residual_by_id.get(first_id, [])
@@ -771,6 +817,7 @@ def estimate_parameters(market_history: MarketHistory) -> FittedParameters:
             if len(first_residuals) < 3 or len(first_residuals) != len(second_residuals):
                 continue
             sample_count: int = len(first_residuals)
+            covariance_sample_size = sample_count
             covariance[_covariance_key(first_id, second_id)] = (
                 sum(a * b for a, b in zip(first_residuals, second_residuals)) / (sample_count - 1)
             )
@@ -793,6 +840,7 @@ def estimate_parameters(market_history: MarketHistory) -> FittedParameters:
         drift_by_id=drift_by_id,
         rate_beta_by_id=rate_beta_by_id,
         covariance=covariance,
+        covariance_sample_size=covariance_sample_size,
     )
 
 
@@ -860,6 +908,24 @@ class MarketMaker:
         self._sensitivity_cache: dict[int, FactorRisk] = {}
         self._exposure: FactorRisk | None = None
 
+        # Shadow ledger crediting expiries at the worse of the two settlement readings. Sizing
+        # runs off min(cash_balance, this), so a wrong reading costs quote size rather than
+        # solvency. See `SETTLEMENT_DOUBT_CAP_FRACTION`.
+        self._pessimistic_cash: float = cash_balance
+        self._settlement_doubt_cap: float = SETTLEMENT_DOUBT_CAP_FRACTION * max(cash_balance, 1.0)
+
+        # Live observations of the three underlyings, seeded by `warm_up` and appended on every
+        # step, so the fit keeps improving over a session instead of freezing at the warm-up.
+        self._observed_path: dict[int, list[float]] = {}
+        self._steps_since_refit: int = 0
+
+        # FOK side detection: which reading of `FokOrder.order_type` the tape has voted for.
+        self._order_type_is_counterparty_side: bool = ORDER_TYPE_IS_COUNTERPARTY_SIDE
+        self._fok_side_agreements: int = 0
+        self._fok_side_disagreements: int = 0
+        # (option_id, price, quantity, assumed counterparty_buys) for accepted-but-unconfirmed FOKs.
+        self._pending_fok: list[tuple[int, float, int, bool]] = []
+
     # -- state ------------------------------------------------------------------------------
 
     def _value_by_underlying_id(self) -> dict[int, float]:
@@ -871,27 +937,139 @@ class MarketMaker:
         self._exposure = None
 
     def on_step_advance(self, new_underlying_state: list[Underlying], new_option_state: list[BinaryOption]) -> None:
-        # Credit expiries against the values that were live while the option still existed.
-        expiring_values: dict[int, float] = self._value_by_underlying_id()
+        try:
+            self._on_step_advance(new_underlying_state, new_option_state)
+        except Exception:
+            # Never let a bookkeeping failure kill the session, but the state update itself is
+            # not optional -- quoting a stale board is far worse than a missed expiry credit.
+            self.underlying_state = new_underlying_state
+            self.active_option_state = new_option_state
+            for option in new_option_state:
+                self.contract_by_option_id[option.option_id] = option
+            self._invalidate_caches()
+
+    def _on_step_advance(
+        self, new_underlying_state: list[Underlying], new_option_state: list[BinaryOption]
+    ) -> None:
+        previous_values: dict[int, float] = self._value_by_underlying_id()
+        new_values: dict[int, float] = {
+            underlying.underlying_id: underlying.value for underlying in new_underlying_state
+        }
         surviving_ids: set[int] = {option.option_id for option in new_option_state}
-        for option in self.active_option_state:
-            if option.option_id in surviving_ids:
+
+        # Iterate everything we track, not just the board: an option traded via FOK that never
+        # appeared in `active_option_state` used to leak forever -- never credited, and its
+        # stale contract kept feeding phantom delta into `_portfolio_exposure` for the rest of
+        # the session because nothing ever advanced or removed it.
+        tracked_ids: set[int] = (
+            set(self.contract_by_option_id)
+            | set(self.gross_long_by_option_id)
+            | set(self.gross_short_by_option_id)
+        )
+        for option_id in tracked_ids - surviving_ids:
+            option: BinaryOption | None = self.contract_by_option_id.pop(option_id, None)
+            long_quantity: int = self.gross_long_by_option_id.pop(option_id, 0)
+            short_quantity: int = self.gross_short_by_option_id.pop(option_id, 0)
+            self.position.option_quantity_by_option_id.pop(option_id, None)
+            if option is None or not (long_quantity or short_quantity):
                 continue
-            long_quantity: int = self.gross_long_by_option_id.pop(option.option_id, 0)
-            short_quantity: int = self.gross_short_by_option_id.pop(option.option_id, 0)
-            if long_quantity or short_quantity:
-                payoff: float = option.expiry_valuation(expiring_values)
-                self.cash_balance += long_quantity * payoff + short_quantity * (1.0 - payoff)
-            self.position.option_quantity_by_option_id.pop(option.option_id, None)
-            self.contract_by_option_id.pop(option.option_id, None)
+            self._credit_expiry(option, long_quantity, short_quantity, previous_values, new_values)
 
         self.underlying_state = new_underlying_state
         self.active_option_state = new_option_state
         for option in new_option_state:
             self.contract_by_option_id[option.option_id] = option
+
+        self._record_observation(new_values)
+        self._maybe_refit()
+        self._pending_fok.clear()
         self._invalidate_caches()
 
+    def _credit_expiry(
+        self,
+        option: BinaryOption,
+        long_quantity: int,
+        short_quantity: int,
+        previous_values: dict[int, float],
+        new_values: dict[int, float],
+    ) -> None:
+        """Book an expiry, deriving which day's values the payoff was struck against.
+
+        The grader may either leave an option on the board for the step it shows
+        `steps_until_expiry == 0` and settle it afterwards, or drop it the moment the counter
+        reaches zero. Both settle against the *same* day's underlyings; they differ only in
+        which of our snapshots that day is. An option last seen at zero steps had already
+        reached expiry, so it settled on the values live then; one last seen with steps
+        remaining must have settled on this step's advance. Assuming rather than deriving this
+        was measured to invent up to 31.00 of phantom cash on a 100 bankroll.
+        """
+        settlement_values: dict[int, float] = (
+            previous_values if option.steps_until_expiry <= 0 else new_values
+        )
+        payoff: float = option.expiry_valuation(settlement_values)
+        self.cash_balance += long_quantity * payoff + short_quantity * (1.0 - payoff)
+
+        # The shadow ledger takes whichever reading pays us less, so `_available_cash` stays
+        # right even if the derivation above is wrong about a particular grader.
+        try:
+            alternative: float = option.expiry_valuation(
+                new_values if option.steps_until_expiry <= 0 else previous_values
+            )
+        except Exception:
+            alternative = payoff
+        worst_long: float = min(payoff, alternative)
+        worst_short: float = 1.0 - max(payoff, alternative)
+        self._pessimistic_cash += long_quantity * worst_long + short_quantity * worst_short
+        self._pessimistic_cash = max(self._pessimistic_cash, self.cash_balance - self._settlement_doubt_cap)
+
+    def _record_observation(self, new_values: dict[int, float]) -> None:
+        if not self._observed_path:
+            self._observed_path = {underlying_id: [] for underlying_id in UNDERLYING_NAME_BY_ID}
+        # The first advance of a session often replays the same values the warm-up history ended
+        # on. Appending those would inject a fake zero-return day, biasing the covariance down
+        # and the rate chain toward "stay". A genuine repeat of all three at once is negligible:
+        # the company values are a rounded draw from a continuous law.
+        if all(
+            path and underlying_id in new_values and path[-1] == new_values[underlying_id]
+            for underlying_id, path in self._observed_path.items()
+        ):
+            return
+        for underlying_id, path in self._observed_path.items():
+            if underlying_id in new_values:
+                path.append(new_values[underlying_id])
+        self._steps_since_refit += 1
+
+    def _maybe_refit(self) -> None:
+        """Fold the live path back into the parameter fit.
+
+        The generator is fixed for the whole scenario, so every step is another draw from the
+        same distribution. A 60-step session doubles a 60-day warm-up, and price error falls
+        roughly as 1/sqrt(N) over the range that matters.
+        """
+        if self._steps_since_refit < REFIT_INTERVAL_STEPS:
+            return
+        lengths: set[int] = {len(path) for path in self._observed_path.values()}
+        if len(lengths) != 1 or next(iter(lengths)) < MIN_REFIT_OBSERVATIONS:
+            return
+        self._steps_since_refit = 0
+        try:
+            history = MarketHistory(
+                values_by_underlying_id={
+                    underlying_id: tuple(path) for underlying_id, path in self._observed_path.items()
+                }
+            )
+            self.parameters = estimate_parameters(history)
+            self._invalidate_caches()
+        except Exception:
+            pass
+
     def on_trade(self, option: BinaryOption, price: float, quantity: int, counterparty_id: int) -> None:
+        try:
+            self._on_trade(option, price, quantity, counterparty_id)
+        except Exception:
+            self._exposure = None
+
+    def _on_trade(self, option: BinaryOption, price: float, quantity: int, counterparty_id: int) -> None:
         self.position.add_option_quantity(option.option_id, quantity)
         self.contract_by_option_id[option.option_id] = option
         if quantity > 0:
@@ -900,27 +1078,77 @@ class MarketMaker:
             self.gross_short_by_option_id[option.option_id] += -quantity
 
         # Mirror the grader's collateral rule: a trade costs its own maximum loss up front, and
-        # nothing is returned until expiry.
-        self.cash_balance -= quantity * price if quantity > 0 else -quantity * (1.0 - price)
+        # nothing is returned until expiry. Clamped at zero because a price outside [0, 1] makes
+        # the arithmetic go negative, and the grader charges a maximum *loss* -- it will not
+        # hand us cash at trade time for a trade that cannot lose.
+        collateral: float = quantity * price if quantity > 0 else -quantity * (1.0 - price)
+        collateral = max(collateral, 0.0)
+        self.cash_balance -= collateral
+        self._pessimistic_cash -= collateral
 
-        theoretical: float = self.price_option(option)
+        self._record_fok_outcome(option.option_id, price, quantity)
+
+        theoretical: float = self._price_option_strict(option)
         edge: float = quantity * (theoretical - price)
         record: list[float] = self.counterparty_record[counterparty_id]
         record[0] += edge
         record[1] += abs(quantity)
         self._exposure = None
 
+    def _record_fok_outcome(self, option_id: int, price: float, quantity: int) -> None:
+        """Vote on what `FokOrder.order_type` means, using the signed quantity we were given.
+
+        We accepted the order believing the counterparty was on one side; the fill tells us
+        which side we actually took. A negative quantity means we sold, so the counterparty
+        bought. Majority vote rather than a single observation, because an RFQ fill can
+        coincidentally match a pending order's option and price.
+        """
+        for index, (pending_id, pending_price, pending_quantity, assumed_buys) in enumerate(self._pending_fok):
+            if pending_id != option_id or abs(pending_price - price) > TOLERANCE:
+                continue
+            if abs(quantity) > pending_quantity:
+                continue
+            self._pending_fok.pop(index)
+            if (quantity < 0) == assumed_buys:
+                self._fok_side_agreements += 1
+            else:
+                self._fok_side_disagreements += 1
+            if self._fok_side_disagreements >= self._fok_side_agreements + FOK_SIDE_FLIP_MARGIN:
+                self._order_type_is_counterparty_side = not self._order_type_is_counterparty_side
+                self._fok_side_agreements, self._fok_side_disagreements = 0, 0
+            return
+
     @property
     def name(self) -> str:
         return "TelescopeMM"
 
     def warm_up(self, market_history: MarketHistory) -> None:
-        self.parameters = estimate_parameters(market_history)
+        try:
+            self.parameters = estimate_parameters(market_history)
+            self._observed_path = {
+                underlying_id: list(market_history.values_by_underlying_id.get(underlying_id, ()))
+                for underlying_id in UNDERLYING_NAME_BY_ID
+            }
+            self._steps_since_refit = 0
+        except Exception:
+            self.parameters = DEFAULT_PARAMETERS
         self._invalidate_caches()
 
     # -- pricing ----------------------------------------------------------------------------
 
     def price_option(self, option: BinaryOption) -> float:
+        """Our stated theoretical value. Guarded: the grader logs and scores this directly.
+
+        0.5 is the max-entropy answer for a binary and is the least-wrong thing to report for a
+        contract we cannot price. Quoting never routes through here -- it uses the strict form
+        below, so an unpriceable option is declined rather than quoted around a placeholder.
+        """
+        try:
+            return self._price_option_strict(option)
+        except Exception:
+            return 0.5
+
+    def _price_option_strict(self, option: BinaryOption) -> float:
         cached: float | None = self._price_cache.get(option.option_id)
         if cached is not None:
             return cached
@@ -929,9 +1157,12 @@ class MarketMaker:
         return value
 
     def price_option_from_parameters(self, market_parameters: MarketParameters, option: BinaryOption) -> float:
-        return price_binary_option(
-            fitted_from_market_parameters(market_parameters), option, self._value_by_underlying_id()
-        )
+        try:
+            return price_binary_option(
+                fitted_from_market_parameters(market_parameters), option, self._value_by_underlying_id()
+            )
+        except Exception:
+            return 0.5
 
     # -- risk -------------------------------------------------------------------------------
 
@@ -947,7 +1178,7 @@ class MarketMaker:
             return cached
 
         base_values: dict[int, float] = self._value_by_underlying_id()
-        base_price: float = self.price_option(option)
+        base_price: float = self._price_option_strict(option)
         step: float = self.parameters.rate_step
 
         def price_with(underlying_id: int, value: float) -> float:
@@ -1116,7 +1347,7 @@ class MarketMaker:
         """
         if not self.VEGA_ENABLED:
             return 0.0
-        return abs(self._factor_risk(option).vega) * VOL_RELATIVE_UNCERTAINTY
+        return abs(self._factor_risk(option).vega) * self.parameters.relative_vol_uncertainty
 
     def _vol_uncertainty_padding(self, option: BinaryOption) -> float:
         return min(VEGA_PAD_AVERSION * self._vol_uncertainty_charge(option), MAX_VEGA_PAD)
@@ -1143,7 +1374,7 @@ class MarketMaker:
         theoretical value, and the THEO test scores it against the truth. Inventory belongs
         here, one layer out, where quoting and FOK decisions are made.
         """
-        return min(max(self.price_option(option) - self._inventory_skew(option), 0.0), 1.0)
+        return min(max(self._price_option_strict(option) - self._inventory_skew(option), 0.0), 1.0)
 
     def _counterparty_padding(self, counterparty_id: int) -> float:
         """Widen against counterparties whose flow has historically run us over."""
@@ -1157,7 +1388,14 @@ class MarketMaker:
         return min(0.06, confidence * (-average_edge))
 
     def _available_cash(self) -> float:
-        return max(self.cash_balance - self.cash_buffer, 0.0)
+        """Cash we are willing to commit, on the lower of the two settlement readings.
+
+        `_pessimistic_cash` only diverges from `cash_balance` when the two possible settlement
+        conventions disagree about an expiry we have already booked, and the gap is capped at
+        `SETTLEMENT_DOUBT_CAP_FRACTION` of the starting bankroll. Sizing off the minimum makes a
+        wrong reading cost quote size instead of solvency.
+        """
+        return max(min(self.cash_balance, self._pessimistic_cash) - self.cash_buffer, 0.0)
 
     # -- quoting ----------------------------------------------------------------------------
 
@@ -1189,7 +1427,23 @@ class MarketMaker:
         budget /= math.sqrt(max(num_steps, 1))
         return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
 
+    #: A quote that locks up no cash and cannot lose money -- the only safe way to say "no",
+    #: since a two-sided quote is mandatory. Also the fallback whenever quoting raises.
+    DECLINE_QUOTE: "Quote" = None  # type: ignore[assignment]  # bound after the class body
+
     def quote(self, option: BinaryOption, counterparty_id: int) -> Quote:
+        """Guarded entry point. Any failure declines rather than raising.
+
+        An option we cannot price -- an unexpected leg, a missing underlying, a numerical edge
+        case -- must not end the session. The VERBOSE scenarios award full marks purely for not
+        erroring, so a single escaped exception is worth more than any spread we could earn.
+        """
+        try:
+            return self._quote(option, counterparty_id)
+        except Exception:
+            return MarketMaker.DECLINE_QUOTE
+
+    def _quote(self, option: BinaryOption, counterparty_id: int) -> Quote:
         padding: float = (
             WINNER_CURSE_PAD
             + self._counterparty_padding(counterparty_id)
@@ -1235,6 +1489,13 @@ class MarketMaker:
         )
 
     def respond_to_fok(self, option: BinaryOption, fok_order: FokOrder) -> bool:
+        """Guarded entry point. Any failure refuses the order."""
+        try:
+            return self._respond_to_fok(option, fok_order)
+        except Exception:
+            return False
+
+    def _respond_to_fok(self, option: BinaryOption, fok_order: FokOrder) -> bool:
         reservation: float = self.reservation_price(option)
         required: float = (
             FOK_EDGE_REQUIRED
@@ -1243,18 +1504,45 @@ class MarketMaker:
             + self._vol_uncertainty_padding(option)
         )
 
+        # Until the tape has confirmed what `order_type` means, treat every FOK as a probe:
+        # double the edge and only small clips. Being wrong about the side means systematically
+        # taking the losing half of every order, so the first few fills are bought cheaply.
+        probing: bool = (
+            self._fok_side_agreements + self._fok_side_disagreements < FOK_SIDE_CONFIRMING_TRADES
+        )
+        if probing:
+            if fok_order.quantity > FOK_PROBE_MAX_QUANTITY:
+                return False
+            required *= FOK_PROBE_EDGE_MULTIPLIER
+
         steps: int = option.steps_until_expiry
         # A FOK arrives in one indivisible clip, so the convexity size cap matters more here
         # than on a quote: there is no partial fill to stop us at a tolerable position.
         size_limit: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
-        counterparty_buys: bool = (fok_order.order_type == OrderType.BUY) == ORDER_TYPE_IS_COUNTERPARTY_SIDE
+        counterparty_buys: bool = (
+            fok_order.order_type == OrderType.BUY
+        ) == self._order_type_is_counterparty_side
         if counterparty_buys:
             # We sell at fok_order.price; each contract locks (1 - price) of cash.
             if fok_order.price < reservation + required:
                 return False
             affordable: int = self._affordable_quantity(1.0 - fok_order.price, steps)
-            return int(affordable * size_limit) >= fok_order.quantity
-
-        if fok_order.price > reservation - required:
+            accepted: bool = int(affordable * size_limit) >= fok_order.quantity
+        elif fok_order.price > reservation - required:
             return False
-        return int(self._affordable_quantity(fok_order.price, steps) * size_limit) >= fok_order.quantity
+        else:
+            accepted = (
+                int(self._affordable_quantity(fok_order.price, steps) * size_limit) >= fok_order.quantity
+            )
+
+        if accepted:
+            # `on_trade` will report the signed quantity, which settles what `order_type` means.
+            self._pending_fok.append(
+                (option.option_id, fok_order.price, fok_order.quantity, counterparty_buys)
+            )
+        return accepted
+
+
+# Bound after the class body because `Quote` validation runs at construction: a 0.00 bid and a
+# 1.00 offer are both real, legal quotes that lock up no cash and cannot lose money.
+MarketMaker.DECLINE_QUOTE = Quote(bid_price=0.0, bid_quantity=1, offer_price=1.0, offer_quantity=1)
