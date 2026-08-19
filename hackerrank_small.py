@@ -206,6 +206,11 @@ WINNER_CURSE_PAD = 0.008
 INVENTORY_AVERSION = 1.5
 MAX_INVENTORY_SKEW = 0.25
 MAX_QUOTE_SIZE = 40
+MIN_LOSS_PROBABILITY = 0.05
+TARGET_FILL_RATE = 0.35
+GENEROSITY_AVERSION = 0.2
+MAX_GENEROSITY_PAD = 0.05
+MIN_QUOTES_FOR_FILL_RATE = 20.0
 INVENTORY_SIZE_SHRINK = 0.25
 GAMMA_AVERSION = 0.0
 GAMMA_PAD_AVERSION = 0.25
@@ -234,6 +239,7 @@ FOK_SIDE_FLIP_MARGIN = 2
 FOK_PROBE_EDGE_MULTIPLIER = 2.0
 FOK_PROBE_CASH_FRACTION = 0.05
 SETTLEMENT_DOUBT_CAP_FRACTION = 0.25
+SEQUENTIAL_CONFIRMING_FILLS = 4
 
 def _norm_cdf(z):
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
@@ -517,6 +523,7 @@ class MarketMaker:
         self.parameters = DEFAULT_PARAMETERS
         self.contract_by_option_id = {option.option_id: option for option in option_initial_state}
         self.counterparty_record = defaultdict(lambda: [0.0, 0.0])
+        self.counterparty_flow = defaultdict(lambda: [0.0, 0.0])
         self._price_cache = {}
         self._sensitivity_cache = {}
         self._exposure = None
@@ -525,11 +532,16 @@ class MarketMaker:
         self._observed_path = {}
         self._steps_since_refit = 0
         self._committed_collateral = 0.0
+        self._live_quote_commitment = 0.0
+        self._last_quote_option_id = None
+        self._sequential_fills = 0
+        self._batched_fills = 0
         self._order_type_is_counterparty_side = ORDER_TYPE_IS_COUNTERPARTY_SIDE
         self._order_type_side_confirmed = ORDER_TYPE_SIDE_CONFIRMED
         self._fok_side_agreements = 0
         self._fok_side_disagreements = 0
         self._pending_fok = []
+        self._last_quoted_counterparty = None
 
     def _value_by_underlying_id(self):
         return {underlying.underlying_id: underlying.value for underlying in self.underlying_state}
@@ -570,6 +582,8 @@ class MarketMaker:
         self._maybe_refit()
         self._pending_fok.clear()
         self._committed_collateral = 0.0
+        self._live_quote_commitment = 0.0
+        self._last_quote_option_id = None
         self._invalidate_caches()
 
     def _credit_expiry(self, option, long_quantity, short_quantity, previous_values, new_values):
@@ -627,7 +641,13 @@ class MarketMaker:
         self.cash_balance -= collateral
         self._pessimistic_cash -= collateral
         self._release_collateral(collateral)
-        self._record_fok_outcome(option.option_id, price, quantity)
+        matched_fok = self._record_fok_outcome(option.option_id, price, quantity)
+        self.counterparty_flow[counterparty_id][1] += 1.0
+        if not matched_fok and self._last_quote_option_id is not None:
+            if option.option_id == self._last_quote_option_id:
+                self._sequential_fills += 1
+            else:
+                self._batched_fills += 1
         theoretical = self._price_option_strict(option)
         edge = quantity * (theoretical - price)
         record = self.counterparty_record[counterparty_id]
@@ -652,7 +672,8 @@ class MarketMaker:
                 self._fok_side_agreements, self._fok_side_disagreements = (0, 0)
             elif self._fok_side_agreements >= FOK_SIDE_CONFIRMING_TRADES:
                 self._order_type_side_confirmed = True
-            return
+            return True
+        return False
 
     @property
     def name(self):
@@ -813,13 +834,19 @@ class MarketMaker:
 
     def _counterparty_padding(self, counterparty_id):
         captured, traded = self.counterparty_record.get(counterparty_id, [0.0, 0.0])
-        if traded < 5.0:
+        if traded >= 5.0:
+            average_edge = captured / traded
+            if average_edge < 0.0:
+                confidence = traded / (traded + 25.0)
+                return min(0.06, confidence * -average_edge)
+        quotes, fills = self.counterparty_flow.get(counterparty_id, [0.0, 0.0])
+        if quotes < MIN_QUOTES_FOR_FILL_RATE:
             return 0.0
-        average_edge = captured / traded
-        if average_edge >= 0.0:
+        fill_rate = fills / quotes
+        if fill_rate <= TARGET_FILL_RATE:
             return 0.0
-        confidence = traded / (traded + 25.0)
-        return min(0.06, confidence * -average_edge)
+        confidence = quotes / (quotes + MIN_QUOTES_FOR_FILL_RATE)
+        return min(MAX_GENEROSITY_PAD, confidence * GENEROSITY_AVERSION * (fill_rate - TARGET_FILL_RATE))
 
     def _available_cash(self):
         return max(min(self.cash_balance, self._pessimistic_cash) - self.cash_buffer, 0.0)
@@ -833,16 +860,24 @@ class MarketMaker:
             bid, offer = (middle - MIN_HALF_SPREAD, middle + MIN_HALF_SPREAD)
         return (bid, offer)
 
-    def _affordable_quantity(self, collateral_per_contract, num_steps=1):
+    def _affordable_quantity(self, collateral_per_contract, num_steps=1, loss_probability=1.0):
         if collateral_per_contract <= TOLERANCE:
             return MAX_QUOTE_SIZE
+        uncommitted = self._uncommitted_cash()
         live_options = max(1, len(self.active_option_state))
-        budget = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * math.sqrt(live_options))
+        budget = uncommitted / (CONCURRENT_LOAD_FACTOR * math.sqrt(live_options))
         budget /= math.sqrt(max(num_steps, 1))
-        return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
+        effective_cost = collateral_per_contract * min(max(loss_probability, MIN_LOSS_PROBABILITY), 1.0)
+        by_risk = int(budget / effective_cost)
+        by_cash = int(uncommitted / collateral_per_contract)
+        return max(0, min(MAX_QUOTE_SIZE, by_risk, by_cash))
 
     def _uncommitted_cash(self):
         return max(self._available_cash() - self._committed_collateral, 0.0)
+
+    @property
+    def _quotes_are_sequential(self):
+        return self._batched_fills == 0 and self._sequential_fills >= SEQUENTIAL_CONFIRMING_FILLS
 
     def _commit_collateral(self, amount):
         self._committed_collateral += max(amount, 0.0)
@@ -856,16 +891,23 @@ class MarketMaker:
             return self._quote(option, counterparty_id)
         except Exception:
             return MarketMaker.DECLINE_QUOTE
+        finally:
+            self.counterparty_flow[counterparty_id][0] += 1.0
+            self._last_quoted_counterparty = counterparty_id
 
     def _quote(self, option, counterparty_id):
+        if self._quotes_are_sequential and self._live_quote_commitment > 0.0:
+            self._release_collateral(self._live_quote_commitment)
+        self._live_quote_commitment = 0.0
+        self._last_quote_option_id = option.option_id
         padding = WINNER_CURSE_PAD + self._counterparty_padding(counterparty_id) + self._model_padding(option)
         skew = self._inventory_skew(option)
         reservation = self.reservation_price(option)
         raw_bid, raw_offer = self._collateral_quote_prices(reservation, option.steps_until_expiry, padding)
         bid_price, offer_price = _snap_quote_prices(raw_bid, raw_offer)
         steps = option.steps_until_expiry
-        bid_quantity = self._affordable_quantity(bid_price, steps)
-        offer_quantity = self._affordable_quantity(1.0 - offer_price, steps)
+        bid_quantity = self._affordable_quantity(bid_price, steps, 1.0 - reservation)
+        offer_quantity = self._affordable_quantity(1.0 - offer_price, steps, reservation)
         size_factor = self._model_size_factor(option)
         bid_quantity = _shrink_quantity(bid_quantity, size_factor)
         offer_quantity = _shrink_quantity(offer_quantity, size_factor)
@@ -878,7 +920,8 @@ class MarketMaker:
         if offer_quantity < 1:
             offer_price, offer_quantity = (1.0, 1)
         bid_price, offer_price = _snap_quote_prices(bid_price, offer_price)
-        self._commit_collateral(max(bid_price * bid_quantity, (1.0 - offer_price) * offer_quantity))
+        self._live_quote_commitment = max(bid_price * bid_quantity, (1.0 - offer_price) * offer_quantity)
+        self._commit_collateral(self._live_quote_commitment)
         return Quote(bid_price=bid_price, bid_quantity=bid_quantity, offer_price=offer_price, offer_quantity=offer_quantity)
 
     def respond_to_fok(self, option, fok_order):
@@ -899,11 +942,11 @@ class MarketMaker:
         if counterparty_buys:
             if fok_order.price < reservation + required:
                 return False
-            accepted = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
+            accepted = self._affordable_quantity(unit_collateral, steps, reservation) >= fok_order.quantity
         elif fok_order.price > reservation - required:
             return False
         else:
-            accepted = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
+            accepted = self._affordable_quantity(unit_collateral, steps, 1.0 - reservation) >= fok_order.quantity
         if accepted and probing:
             accepted = unit_collateral * fok_order.quantity <= FOK_PROBE_CASH_FRACTION * self.risk_capital
         if accepted:

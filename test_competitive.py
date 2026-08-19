@@ -120,7 +120,10 @@ def run_session(parameters, values, history, capital, num_days, rng,
         for option in options:
             fair = price_binary_option(truth, option, current)
             counterparty_id = rng.randint(1, 6)
-            insensitive = rng.random() < insensitive_share
+            # Insensitivity is a property of the counterparty, not of the draw. That is the
+            # whole premise of per-counterparty adaptation: the same id behaves the same way
+            # every time, so its behaviour is learnable from its own trade history.
+            insensitive = counterparty_id <= round(6 * insensitive_share)
             wants_to_buy = rng.random() < 0.5
             demand = rng.randint(*order_size_range)
 

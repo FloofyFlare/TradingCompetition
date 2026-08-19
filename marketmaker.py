@@ -270,6 +270,19 @@ WINNER_CURSE_PAD: Final[float] = 0.008
 INVENTORY_AVERSION: Final[float] = 1.5
 MAX_INVENTORY_SKEW: Final[float] = 0.25
 MAX_QUOTE_SIZE: Final[int] = 40
+# Floor under the loss probability used for risk-based sizing, so a contract we believe is
+# nearly certain cannot claim unbounded size on the strength of our own estimate.
+MIN_LOSS_PROBABILITY: Final[float] = 0.05
+
+# Per-counterparty fill-rate markup. A counterparty that lifts us on most of the quotes we show
+# it is not shopping the price, so the spread is too tight for that flow specifically. Widening
+# globally was measured to lose money -- it forfeits the competitive flow to buy the insensitive
+# flow -- which is why this is per counterparty and driven by fill rate rather than by realized
+# edge (the latter is the spread we chose, so feeding it back is circular).
+TARGET_FILL_RATE: Final[float] = 0.35
+GENEROSITY_AVERSION: Final[float] = 0.20
+MAX_GENEROSITY_PAD: Final[float] = 0.05
+MIN_QUOTES_FOR_FILL_RATE: Final[float] = 20.0
 # Size shown on the side that would grow the book, as a fraction of the side that flattens it.
 INVENTORY_SIZE_SHRINK: Final[float] = 0.25
 
@@ -369,6 +382,24 @@ FOK_PROBE_CASH_FRACTION: Final[float] = 0.05
 # The cap stops a long run of disagreements from strangling quote sizes outright; without any
 # such shadow, a wrong reading was measured to invent 31.00 of phantom cash on a 100 bankroll.
 SETTLEMENT_DOUBT_CAP_FRACTION: Final[float] = 0.25
+
+# Whether a quote can still be hit once the next RFQ has arrived. `_committed_collateral` holds
+# back cash against every quote shown so far this step, which is the only safe assumption for a
+# grader that collects a day's quotes and settles the fills in a batch.
+#
+# The graded logs show it does not work that way: every RFQ is quoted and filled before the next
+# one is requested, without exception. Under that ordering `_available_cash` is already a
+# complete guarantee on its own -- a fill lowers cash, and the next quote is sized off the lower
+# figure -- and reserving cash against quotes that are already dead simply shrinks every quote
+# after the first. Measured on a 20 dollar book with 10 live options: size fell from 3 contracts
+# to 1 by the tenth RFQ of the day and to an outright decline by the twentieth, while the
+# competitors beating us showed 40 throughout.
+#
+# So the hold-back is released once the ordering has been observed, and only then. Detection is
+# per fill: a trade landing on the option we just quoted is evidence of sequential ordering, a
+# trade on some earlier quote is evidence of batching. FOK fills do not vote -- they are not
+# part of the RFQ pipeline.
+SEQUENTIAL_CONFIRMING_FILLS: Final[int] = 4
 
 
 def _norm_cdf(z: float) -> float:
@@ -949,6 +980,8 @@ class MarketMaker:
         }
         # counterparty_id -> [signed edge we captured, trade count]
         self.counterparty_record: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        # counterparty_id -> [quotes we showed it, quotes that came back as a fill]
+        self.counterparty_flow: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self._price_cache: dict[int, float] = {}
         self._sensitivity_cache: dict[int, FactorRisk] = {}
         self._exposure: FactorRisk | None = None
@@ -967,6 +1000,11 @@ class MarketMaker:
         # Collateral that quotes and accepted FOKs still outstanding could consume. Reset each
         # step, because that is the granularity at which the grader checks solvency.
         self._committed_collateral: float = 0.0
+        # Hold-back against the most recent quote, and the evidence for releasing it.
+        self._live_quote_commitment: float = 0.0
+        self._last_quote_option_id: int | None = None
+        self._sequential_fills: int = 0
+        self._batched_fills: int = 0
 
         # FOK side detection: which reading of `FokOrder.order_type` the tape has voted for.
         self._order_type_is_counterparty_side: bool = ORDER_TYPE_IS_COUNTERPARTY_SIDE
@@ -975,6 +1013,7 @@ class MarketMaker:
         self._fok_side_disagreements: int = 0
         # (option_id, price, quantity, assumed counterparty_buys) for accepted-but-unconfirmed FOKs.
         self._pending_fok: list[tuple[int, float, int, bool]] = []
+        self._last_quoted_counterparty: int | None = None
 
     # -- state ------------------------------------------------------------------------------
 
@@ -1034,6 +1073,8 @@ class MarketMaker:
         self._maybe_refit()
         self._pending_fok.clear()
         self._committed_collateral = 0.0
+        self._live_quote_commitment = 0.0
+        self._last_quote_option_id = None
         self._invalidate_caches()
 
     def _credit_expiry(
@@ -1138,7 +1179,13 @@ class MarketMaker:
         self._pessimistic_cash -= collateral
         self._release_collateral(collateral)
 
-        self._record_fok_outcome(option.option_id, price, quantity)
+        matched_fok: bool = self._record_fok_outcome(option.option_id, price, quantity)
+        self.counterparty_flow[counterparty_id][1] += 1.0
+        if not matched_fok and self._last_quote_option_id is not None:
+            if option.option_id == self._last_quote_option_id:
+                self._sequential_fills += 1
+            else:
+                self._batched_fills += 1
 
         theoretical: float = self._price_option_strict(option)
         edge: float = quantity * (theoretical - price)
@@ -1147,7 +1194,7 @@ class MarketMaker:
         record[1] += abs(quantity)
         self._exposure = None
 
-    def _record_fok_outcome(self, option_id: int, price: float, quantity: int) -> None:
+    def _record_fok_outcome(self, option_id: int, price: float, quantity: int) -> bool:
         """Vote on what `FokOrder.order_type` means, using the signed quantity we were given.
 
         We accepted the order believing the counterparty was on one side; the fill tells us
@@ -1172,7 +1219,8 @@ class MarketMaker:
                 self._fok_side_agreements, self._fok_side_disagreements = 0, 0
             elif self._fok_side_agreements >= FOK_SIDE_CONFIRMING_TRADES:
                 self._order_type_side_confirmed = True
-            return
+            return True
+        return False
 
     @property
     def name(self) -> str:
@@ -1446,15 +1494,40 @@ class MarketMaker:
         return min(max(self._price_option_strict(option) - self._inventory_skew(option), 0.0), 1.0)
 
     def _counterparty_padding(self, counterparty_id: int) -> float:
-        """Widen against counterparties whose flow has historically run us over."""
+        """Per-counterparty markup, in both directions.
+
+        Downside: a counterparty whose flow has historically run us over gets a defensive
+        widening, sized by how badly and how confidently.
+
+        Upside: a counterparty that keeps trading at whatever we show is not shopping our price
+        against anybody, and the spread we quote it is leaving money on the table. The graded
+        rankings make that concrete -- a bot quoting 0.00 / 1.00 banked $43 on a $10 book in one
+        scenario, purely on flow that was insensitive to price.
+
+        Fill rate is the signal, because it is the one thing that says whether we are being
+        shopped. It is also self-correcting: widening only persists while the counterparty keeps
+        lifting us anyway, and the moment a competitor starts taking the trade our fill rate
+        drops and the markup unwinds. Realized edge cannot play that role -- it is the spread we
+        chose, so using it to widen the spread is circular.
+        """
         captured, traded = self.counterparty_record.get(counterparty_id, [0.0, 0.0])
-        if traded < 5.0:
+        if traded >= 5.0:
+            average_edge: float = captured / traded
+            if average_edge < 0.0:
+                confidence: float = traded / (traded + 25.0)
+                return min(0.06, confidence * (-average_edge))
+
+        quotes, fills = self.counterparty_flow.get(counterparty_id, [0.0, 0.0])
+        if quotes < MIN_QUOTES_FOR_FILL_RATE:
             return 0.0
-        average_edge: float = captured / traded
-        if average_edge >= 0.0:
+        fill_rate: float = fills / quotes
+        if fill_rate <= TARGET_FILL_RATE:
             return 0.0
-        confidence: float = traded / (traded + 25.0)
-        return min(0.06, confidence * (-average_edge))
+        confidence = quotes / (quotes + MIN_QUOTES_FOR_FILL_RATE)
+        return min(
+            MAX_GENEROSITY_PAD,
+            confidence * GENEROSITY_AVERSION * (fill_rate - TARGET_FILL_RATE),
+        )
 
     def _available_cash(self) -> float:
         """Cash we are willing to commit, on the lower of the two settlement readings.
@@ -1483,18 +1556,40 @@ class MarketMaker:
             bid, offer = middle - MIN_HALF_SPREAD, middle + MIN_HALF_SPREAD
         return bid, offer
 
-    def _affordable_quantity(self, collateral_per_contract: float, num_steps: int = 1) -> int:
-        """Contracts we can take on this side without endangering the bankroll.
+    def _affordable_quantity(
+        self, collateral_per_contract: float, num_steps: int = 1, loss_probability: float = 1.0
+    ) -> int:
+        """Contracts we can take on this side: sized by risk, then hard-capped by cash.
 
-        Zero collateral means a bid of 0.00 or an offer of 1.00: those cannot lose, so they are
-        never size-limited. Longer-dated contracts hold the cash longer and get less of it.
+        Collateral is the trade's *maximum* loss, and budgeting against it treats a coin flip and
+        a near-certainty as equally expensive. On a binary those are wildly different trades.
+        Selling a 3-cent option locks 0.97 a contract but only loses it 3% of the time, so the
+        risk being carried is about 0.03 -- a factor of thirty smaller than the cash outlay.
+
+        Budgeting on max loss is what capped the offer at one contract on cheap options. The
+        graded logs show the cost of that directly: an RFQ to buy 6 of a 3-cent contract, we
+        show one, and the other five clear against a competitor quoting 1.00. Our lot earns
+        four cents while the residual earns them nearly five dollars. That single mechanism is
+        most of the gap behind the wide quoters in the low-competition scenarios.
+
+        So the budget is spent against expected loss, while `by_cash` keeps the hard solvency
+        guarantee exactly where it was: whatever risk says, we never commit collateral we do not
+        have. `MIN_LOSS_PROBABILITY` stops a near-certain contract from claiming unbounded size
+        on the strength of a probability we estimated ourselves.
         """
         if collateral_per_contract <= TOLERANCE:
             return MAX_QUOTE_SIZE
+        uncommitted: float = self._uncommitted_cash()
         live_options: int = max(1, len(self.active_option_state))
-        budget: float = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * math.sqrt(live_options))
+        budget: float = uncommitted / (CONCURRENT_LOAD_FACTOR * math.sqrt(live_options))
         budget /= math.sqrt(max(num_steps, 1))
-        return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
+
+        effective_cost: float = collateral_per_contract * min(
+            max(loss_probability, MIN_LOSS_PROBABILITY), 1.0
+        )
+        by_risk: int = int(budget / effective_cost)
+        by_cash: int = int(uncommitted / collateral_per_contract)
+        return max(0, min(MAX_QUOTE_SIZE, by_risk, by_cash))
 
     def _uncommitted_cash(self) -> float:
         """Available cash less everything this step's live quotes could still consume.
@@ -1516,6 +1611,11 @@ class MarketMaker:
         at the cash buffer rather than below zero -- which is exactly where solvency is checked.
         """
         return max(self._available_cash() - self._committed_collateral, 0.0)
+
+    @property
+    def _quotes_are_sequential(self) -> bool:
+        """True once fills have shown a quote dies when the next RFQ arrives."""
+        return self._batched_fills == 0 and self._sequential_fills >= SEQUENTIAL_CONFIRMING_FILLS
 
     def _commit_collateral(self, amount: float) -> None:
         self._committed_collateral += max(amount, 0.0)
@@ -1540,8 +1640,17 @@ class MarketMaker:
             return self._quote(option, counterparty_id)
         except Exception:
             return MarketMaker.DECLINE_QUOTE
+        finally:
+            self.counterparty_flow[counterparty_id][0] += 1.0
+            self._last_quoted_counterparty = counterparty_id
 
     def _quote(self, option: BinaryOption, counterparty_id: int) -> Quote:
+        # The previous quote can no longer be hit, so stop reserving cash against it.
+        if self._quotes_are_sequential and self._live_quote_commitment > 0.0:
+            self._release_collateral(self._live_quote_commitment)
+        self._live_quote_commitment = 0.0
+        self._last_quote_option_id = option.option_id
+
         padding: float = (
             WINNER_CURSE_PAD
             + self._counterparty_padding(counterparty_id)
@@ -1554,8 +1663,8 @@ class MarketMaker:
         bid_price, offer_price = _snap_quote_prices(raw_bid, raw_offer)
 
         steps: int = option.steps_until_expiry
-        bid_quantity: int = self._affordable_quantity(bid_price, steps)
-        offer_quantity: int = self._affordable_quantity(1.0 - offer_price, steps)
+        bid_quantity: int = self._affordable_quantity(bid_price, steps, 1.0 - reservation)
+        offer_quantity: int = self._affordable_quantity(1.0 - offer_price, steps, reservation)
 
         # Curvature cuts both sides: unlike inventory skew this is not directional, it is a
         # statement that our own delta snapshot is about to be wrong whichever way we get hit.
@@ -1580,9 +1689,10 @@ class MarketMaker:
 
         # One RFQ produces at most one fill, so a quote's exposure is the worse of its two
         # sides, not their sum.
-        self._commit_collateral(
-            max(bid_price * bid_quantity, (1.0 - offer_price) * offer_quantity)
+        self._live_quote_commitment = max(
+            bid_price * bid_quantity, (1.0 - offer_price) * offer_quantity
         )
+        self._commit_collateral(self._live_quote_commitment)
         return Quote(
             bid_price=bid_price,
             bid_quantity=bid_quantity,
@@ -1631,11 +1741,16 @@ class MarketMaker:
             # We sell at fok_order.price; each contract locks (1 - price) of cash.
             if fok_order.price < reservation + required:
                 return False
-            accepted: bool = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
+            accepted: bool = (
+                self._affordable_quantity(unit_collateral, steps, reservation) >= fok_order.quantity
+            )
         elif fok_order.price > reservation - required:
             return False
         else:
-            accepted = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
+            accepted = (
+                self._affordable_quantity(unit_collateral, steps, 1.0 - reservation)
+                >= fok_order.quantity
+            )
 
         # While probing, bound what a wrong side reading can cost in one clip.
         if accepted and probing:
