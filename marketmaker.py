@@ -270,6 +270,8 @@ WINNER_CURSE_PAD: Final[float] = 0.008
 INVENTORY_AVERSION: Final[float] = 1.5
 MAX_INVENTORY_SKEW: Final[float] = 0.25
 MAX_QUOTE_SIZE: Final[int] = 40
+# Size shown on the side that would grow the book, as a fraction of the side that flattens it.
+INVENTORY_SIZE_SHRINK: Final[float] = 0.25
 
 # Convexity knobs. Binary payoffs are step functions, so delta is not stable: near the strike
 # and near expiry it is enormous and flips sign on the other side. `GAMMA_AVERSION` weights the
@@ -327,16 +329,20 @@ CASH_BUFFER_FRACTION: Final[float] = 0.10
 MIN_CASH_BUFFER: Final[float] = 2.0
 FOK_EDGE_REQUIRED: Final[float] = 0.015
 
-# The counterparty's own direction, used only as the starting guess: `on_trade` reports the
-# signed quantity we actually received, so an accepted FOK tells us which reading is right and
-# `_record_fok_outcome` flips this if the tape disagrees. Until enough fills have voted, FOKs
-# are treated as probes -- double edge required, and only small clips -- which bounds the cost
-# of starting on the wrong guess to a few cents.
+# The counterparty's own direction. Confirmed against the first live run's logs, which print
+# both pipelines in the same vocabulary: an RFQ logged as "sell 6" was followed by "TelescopeMM
+# bought", so the side printed -- and therefore `order_type` -- is the counterparty's, not ours.
+# `ORDER_TYPE_SIDE_CONFIRMED` seeds the vote as settled on that evidence; `_record_fok_outcome`
+# still watches every fill and flips if the tape ever disagrees.
 ORDER_TYPE_IS_COUNTERPARTY_SIDE: Final[bool] = True
+ORDER_TYPE_SIDE_CONFIRMED: Final[bool] = True
 FOK_SIDE_CONFIRMING_TRADES: Final[int] = 3
 FOK_SIDE_FLIP_MARGIN: Final[int] = 2
-FOK_PROBE_MAX_QUANTITY: Final[int] = 3
 FOK_PROBE_EDGE_MULTIPLIER: Final[float] = 2.0
+# Probe exposure is capped as a share of cash, not as a contract count. A fixed count of 3 was
+# a deadlock: live FOKs arrive in clips of 8 to 26, so every one was refused, so no fill ever
+# voted, so the probe never ended and the doubled edge applied for the whole session.
+FOK_PROBE_CASH_FRACTION: Final[float] = 0.05
 
 # Settlement timing. `on_step_advance` derives, per expiring option, which day's values the
 # payoff was struck against (see `_settlement_values_for`). `_pessimistic_cash` shadows the main
@@ -844,6 +850,26 @@ def estimate_parameters(market_history: MarketHistory) -> FittedParameters:
     )
 
 
+
+def _shrink_quantity(quantity: int, factor: float) -> int:
+    """Scale a quote size without ever rounding a tradeable size down to nothing.
+
+    Every shrink here is a *risk* adjustment -- convexity, vol uncertainty, inventory skew --
+    and each is a multiplier below one. On the bankrolls this competition actually hands out
+    (10 to 40 dollars) `_affordable_quantity` returns 1 to 6 contracts, so a plain `int()` turned
+    the common case into zero: a size factor of 0.448 took one contract to none, which the
+    quoting path then had to express as a 0.00 bid or a 1.00 offer.
+
+    That is not "quote smaller", it is "withdraw", and it forfeits the whole RFQ. It is what the
+    first live run did on nearly every request. One contract at a real price carries at most one
+    contract of risk, which is precisely what these shrinks were trying to arrive at, so the
+    floor is kept at one whenever there was anything to trade at all.
+    """
+    if quantity < 1:
+        return 0
+    return max(1, int(quantity * factor))
+
+
 def _snap_quote_prices(bid_value: float, offer_value: float) -> tuple[float, float]:
     """Round outward to whole pennies and enforce 0 <= bid < offer <= 1."""
     bid_pennies: int = min(max(int(math.floor(bid_value * 100.0 + 1e-9)), 0), 99)
@@ -925,6 +951,7 @@ class MarketMaker:
 
         # FOK side detection: which reading of `FokOrder.order_type` the tape has voted for.
         self._order_type_is_counterparty_side: bool = ORDER_TYPE_IS_COUNTERPARTY_SIDE
+        self._order_type_side_confirmed: bool = ORDER_TYPE_SIDE_CONFIRMED
         self._fok_side_agreements: int = 0
         self._fok_side_disagreements: int = 0
         # (option_id, price, quantity, assumed counterparty_buys) for accepted-but-unconfirmed FOKs.
@@ -1120,8 +1147,12 @@ class MarketMaker:
             else:
                 self._fok_side_disagreements += 1
             if self._fok_side_disagreements >= self._fok_side_agreements + FOK_SIDE_FLIP_MARGIN:
+                # The tape beats the seeded evidence: flip, and re-probe from scratch.
                 self._order_type_is_counterparty_side = not self._order_type_is_counterparty_side
+                self._order_type_side_confirmed = False
                 self._fok_side_agreements, self._fok_side_disagreements = 0, 0
+            elif self._fok_side_agreements >= FOK_SIDE_CONFIRMING_TRADES:
+                self._order_type_side_confirmed = True
             return
 
     @property
@@ -1429,7 +1460,7 @@ class MarketMaker:
         if collateral_per_contract <= TOLERANCE:
             return MAX_QUOTE_SIZE
         live_options: int = max(1, len(self.active_option_state))
-        budget: float = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * live_options)
+        budget: float = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * math.sqrt(live_options))
         budget /= math.sqrt(max(num_steps, 1))
         return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
 
@@ -1498,14 +1529,14 @@ class MarketMaker:
         # Curvature cuts both sides: unlike inventory skew this is not directional, it is a
         # statement that our own delta snapshot is about to be wrong whichever way we get hit.
         size_factor: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
-        bid_quantity = int(bid_quantity * size_factor)
-        offer_quantity = int(offer_quantity * size_factor)
+        bid_quantity = _shrink_quantity(bid_quantity, size_factor)
+        offer_quantity = _shrink_quantity(offer_quantity, size_factor)
 
         # Show size on the side that flattens the book, minimal size on the side that grows it.
         if skew > 0.0:
-            bid_quantity = bid_quantity // 4
+            bid_quantity = _shrink_quantity(bid_quantity, INVENTORY_SIZE_SHRINK)
         elif skew < 0.0:
-            offer_quantity = offer_quantity // 4
+            offer_quantity = _shrink_quantity(offer_quantity, INVENTORY_SIZE_SHRINK)
 
         # A two-sided quote is mandatory, so "decline" has to be expressed as a price. Bidding
         # 0.00 and offering 1.00 lock up no cash and cannot lose money, which makes them the
@@ -1545,43 +1576,45 @@ class MarketMaker:
         )
 
         # Until the tape has confirmed what `order_type` means, treat every FOK as a probe:
-        # double the edge and only small clips. Being wrong about the side means systematically
-        # taking the losing half of every order, so the first few fills are bought cheaply.
+        # double the edge, and cap the exposure as a share of cash. Being wrong about the side
+        # means systematically taking the losing half of every order, so the first fills are
+        # bought cheaply -- but the cap has to be something a real order can satisfy, or no fill
+        # ever votes and the probe never ends.
         probing: bool = (
-            self._fok_side_agreements + self._fok_side_disagreements < FOK_SIDE_CONFIRMING_TRADES
+            not self._order_type_side_confirmed
+            and self._fok_side_agreements + self._fok_side_disagreements < FOK_SIDE_CONFIRMING_TRADES
         )
         if probing:
-            if fok_order.quantity > FOK_PROBE_MAX_QUANTITY:
-                return False
             required *= FOK_PROBE_EDGE_MULTIPLIER
 
         steps: int = option.steps_until_expiry
-        # A FOK arrives in one indivisible clip, so the convexity size cap matters more here
-        # than on a quote: there is no partial fill to stop us at a tolerable position.
-        size_limit: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
+        # No size shrink here, unlike a quote. `required` already carries the convexity and vol
+        # charges in price terms, and `_affordable_quantity` already bounds the clip to what the
+        # bankroll can take; multiplying a third haircut on top refused trades that were both
+        # affordable and profitable. The first live run passed on a 17-lot worth +0.61 on a
+        # 40 dollar book -- while scoring 0.00 for the session -- for exactly this reason.
         counterparty_buys: bool = (
             fok_order.order_type == OrderType.BUY
         ) == self._order_type_is_counterparty_side
+        unit_collateral: float = 1.0 - fok_order.price if counterparty_buys else fok_order.price
         if counterparty_buys:
             # We sell at fok_order.price; each contract locks (1 - price) of cash.
             if fok_order.price < reservation + required:
                 return False
-            affordable: int = self._affordable_quantity(1.0 - fok_order.price, steps)
-            accepted: bool = int(affordable * size_limit) >= fok_order.quantity
+            accepted: bool = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
         elif fok_order.price > reservation - required:
             return False
         else:
-            accepted = (
-                int(self._affordable_quantity(fok_order.price, steps) * size_limit) >= fok_order.quantity
-            )
+            accepted = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
+
+        # While probing, bound what a wrong side reading can cost in one clip.
+        if accepted and probing:
+            accepted = unit_collateral * fok_order.quantity <= FOK_PROBE_CASH_FRACTION * self.risk_capital
 
         if accepted:
             # `on_trade` will report the signed quantity, which settles what `order_type` means.
             self._pending_fok.append(
                 (option.option_id, fok_order.price, fok_order.quantity, counterparty_buys)
-            )
-            unit_collateral: float = (
-                1.0 - fok_order.price if counterparty_buys else fok_order.price
             )
             self._commit_collateral(unit_collateral * fok_order.quantity)
         return accepted

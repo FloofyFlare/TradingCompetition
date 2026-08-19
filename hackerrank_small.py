@@ -206,6 +206,7 @@ WINNER_CURSE_PAD = 0.008
 INVENTORY_AVERSION = 1.5
 MAX_INVENTORY_SKEW = 0.25
 MAX_QUOTE_SIZE = 40
+INVENTORY_SIZE_SHRINK = 0.25
 GAMMA_AVERSION = 0.0
 GAMMA_PAD_AVERSION = 0.25
 MAX_GAMMA_PAD = 0.04
@@ -225,10 +226,11 @@ CASH_BUFFER_FRACTION = 0.1
 MIN_CASH_BUFFER = 2.0
 FOK_EDGE_REQUIRED = 0.015
 ORDER_TYPE_IS_COUNTERPARTY_SIDE = True
+ORDER_TYPE_SIDE_CONFIRMED = True
 FOK_SIDE_CONFIRMING_TRADES = 3
 FOK_SIDE_FLIP_MARGIN = 2
-FOK_PROBE_MAX_QUANTITY = 3
 FOK_PROBE_EDGE_MULTIPLIER = 2.0
+FOK_PROBE_CASH_FRACTION = 0.05
 SETTLEMENT_DOUBT_CAP_FRACTION = 0.25
 
 def _norm_cdf(z):
@@ -476,6 +478,11 @@ def estimate_parameters(market_history):
     covariance[cross_key] = min(max(covariance[cross_key], -0.999 * variance_bound), 0.999 * variance_bound)
     return FittedParameters(rate_step=rate_step, rate_intercept_up=intercept_up, rate_slope=slope, rate_intercept_down=intercept_down, drift_by_id=drift_by_id, rate_beta_by_id=rate_beta_by_id, covariance=covariance, covariance_sample_size=covariance_sample_size)
 
+def _shrink_quantity(quantity, factor):
+    if quantity < 1:
+        return 0
+    return max(1, int(quantity * factor))
+
 def _snap_quote_prices(bid_value, offer_value):
     bid_pennies = min(max(int(math.floor(bid_value * 100.0 + 1e-09)), 0), 99)
     offer_pennies = min(max(int(math.ceil(offer_value * 100.0 - 1e-09)), 1), 100)
@@ -517,6 +524,7 @@ class MarketMaker:
         self._steps_since_refit = 0
         self._committed_collateral = 0.0
         self._order_type_is_counterparty_side = ORDER_TYPE_IS_COUNTERPARTY_SIDE
+        self._order_type_side_confirmed = ORDER_TYPE_SIDE_CONFIRMED
         self._fok_side_agreements = 0
         self._fok_side_disagreements = 0
         self._pending_fok = []
@@ -638,7 +646,10 @@ class MarketMaker:
                 self._fok_side_disagreements += 1
             if self._fok_side_disagreements >= self._fok_side_agreements + FOK_SIDE_FLIP_MARGIN:
                 self._order_type_is_counterparty_side = not self._order_type_is_counterparty_side
+                self._order_type_side_confirmed = False
                 self._fok_side_agreements, self._fok_side_disagreements = (0, 0)
+            elif self._fok_side_agreements >= FOK_SIDE_CONFIRMING_TRADES:
+                self._order_type_side_confirmed = True
             return
 
     @property
@@ -817,7 +828,7 @@ class MarketMaker:
         if collateral_per_contract <= TOLERANCE:
             return MAX_QUOTE_SIZE
         live_options = max(1, len(self.active_option_state))
-        budget = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * live_options)
+        budget = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * math.sqrt(live_options))
         budget /= math.sqrt(max(num_steps, 1))
         return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
 
@@ -847,12 +858,12 @@ class MarketMaker:
         bid_quantity = self._affordable_quantity(bid_price, steps)
         offer_quantity = self._affordable_quantity(1.0 - offer_price, steps)
         size_factor = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
-        bid_quantity = int(bid_quantity * size_factor)
-        offer_quantity = int(offer_quantity * size_factor)
+        bid_quantity = _shrink_quantity(bid_quantity, size_factor)
+        offer_quantity = _shrink_quantity(offer_quantity, size_factor)
         if skew > 0.0:
-            bid_quantity = bid_quantity // 4
+            bid_quantity = _shrink_quantity(bid_quantity, INVENTORY_SIZE_SHRINK)
         elif skew < 0.0:
-            offer_quantity = offer_quantity // 4
+            offer_quantity = _shrink_quantity(offer_quantity, INVENTORY_SIZE_SHRINK)
         if bid_quantity < 1:
             bid_price, bid_quantity = (0.0, 1)
         if offer_quantity < 1:
@@ -870,26 +881,24 @@ class MarketMaker:
     def _respond_to_fok(self, option, fok_order):
         reservation = self.reservation_price(option)
         required = FOK_EDGE_REQUIRED + self._counterparty_padding(fok_order.counterparty_id) + self._convexity_padding(option) + self._vol_uncertainty_padding(option)
-        probing = self._fok_side_agreements + self._fok_side_disagreements < FOK_SIDE_CONFIRMING_TRADES
+        probing = not self._order_type_side_confirmed and self._fok_side_agreements + self._fok_side_disagreements < FOK_SIDE_CONFIRMING_TRADES
         if probing:
-            if fok_order.quantity > FOK_PROBE_MAX_QUANTITY:
-                return False
             required *= FOK_PROBE_EDGE_MULTIPLIER
         steps = option.steps_until_expiry
-        size_limit = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
         counterparty_buys = (fok_order.order_type == OrderType.BUY) == self._order_type_is_counterparty_side
+        unit_collateral = 1.0 - fok_order.price if counterparty_buys else fok_order.price
         if counterparty_buys:
             if fok_order.price < reservation + required:
                 return False
-            affordable = self._affordable_quantity(1.0 - fok_order.price, steps)
-            accepted = int(affordable * size_limit) >= fok_order.quantity
+            accepted = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
         elif fok_order.price > reservation - required:
             return False
         else:
-            accepted = int(self._affordable_quantity(fok_order.price, steps) * size_limit) >= fok_order.quantity
+            accepted = self._affordable_quantity(unit_collateral, steps) >= fok_order.quantity
+        if accepted and probing:
+            accepted = unit_collateral * fok_order.quantity <= FOK_PROBE_CASH_FRACTION * self.risk_capital
         if accepted:
             self._pending_fok.append((option.option_id, fok_order.price, fok_order.quantity, counterparty_buys))
-            unit_collateral = 1.0 - fok_order.price if counterparty_buys else fok_order.price
             self._commit_collateral(unit_collateral * fok_order.quantity)
         return accepted
 MarketMaker.DECLINE_QUOTE = Quote(bid_price=0.0, bid_quantity=1, offer_price=1.0, offer_quantity=1)
