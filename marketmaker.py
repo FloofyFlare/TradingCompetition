@@ -269,6 +269,25 @@ WINNER_CURSE_PAD: Final[float] = 0.008
 INVENTORY_AVERSION: Final[float] = 1.5
 MAX_INVENTORY_SKEW: Final[float] = 0.25
 MAX_QUOTE_SIZE: Final[int] = 40
+
+# Convexity knobs. Binary payoffs are step functions, so delta is not stable: near the strike
+# and near expiry it is enormous and flips sign on the other side. `GAMMA_AVERSION` weights the
+# second-order term in the inventory covariance (1.0 = the textbook Taylor term), which is what
+# catches a book that nets to delta-flat but whose legs all flip the same way on one move.
+# `GAMMA_PAD_AVERSION` charges for that curvature in the spread, and `GAMMA_SIZE_TOLERANCE` is
+# the convexity charge (in price units) at which quoted size is cut in half.
+# `GAMMA_AVERSION` is 0.0 on measurement, not on principle: a paired A/B over 160 simulated
+# sessions found the second-order skew term costs ~4 PnL against uninformed flow and is a wash
+# against informed flow. Charging for curvature and refusing size beat trying to skew it away,
+# because the risk it describes is not directional. Left as one number to flip if that changes.
+GAMMA_AVERSION: Final[float] = 0.0
+GAMMA_PAD_AVERSION: Final[float] = 0.25
+MAX_GAMMA_PAD: Final[float] = 0.04
+GAMMA_SIZE_TOLERANCE: Final[float] = 0.02
+# Bump used for the company log-value derivatives. Small against a per-step sigma of ~0.10, so
+# the second difference resolves real curvature rather than the shape of the whole distribution.
+COMPANY_LOG_BUMP: Final[float] = 0.01
+
 # Collateral is only returned at expiry, so the book's peak usage is roughly
 # (fills per step) x (collateral per fill) x (steps held). Budgeting each quote against the
 # number of live options keeps that product under the bankroll.
@@ -731,7 +750,24 @@ def _snap_quote_prices(bid_value: float, offer_value: float) -> tuple[float, flo
     return bid_pennies / 100.0, offer_pennies / 100.0
 
 
+@dataclass(frozen=True)
+class FactorRisk:
+    """First and second derivatives of a price with respect to the three risk factors.
+
+    Ordered (rate, log AJR, log THR). `delta` is per unit move in the factor; `gamma` is per
+    unit move squared. Both are additive across a book, so the same type carries a single
+    option's risk and the whole portfolio's.
+    """
+
+    delta: tuple[float, float, float]
+    gamma: tuple[float, float, float]
+
+
 class MarketMaker:
+    # Set False to A/B the convexity layer against the delta-only book. Every gamma-aware
+    # adjustment below collapses to its previous behaviour when this is off.
+    GAMMA_ENABLED: bool = True
+
     def __init__(
         self,
         underlying_initial_state: list[Underlying],
@@ -757,8 +793,8 @@ class MarketMaker:
         # counterparty_id -> [signed edge we captured, trade count]
         self.counterparty_record: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self._price_cache: dict[int, float] = {}
-        self._sensitivity_cache: dict[int, tuple[float, float, float]] = {}
-        self._exposure: tuple[float, float, float] | None = None
+        self._sensitivity_cache: dict[int, FactorRisk] = {}
+        self._exposure: FactorRisk | None = None
 
     # -- state ------------------------------------------------------------------------------
 
@@ -835,9 +871,14 @@ class MarketMaker:
 
     # -- risk -------------------------------------------------------------------------------
 
-    def _sensitivity(self, option: BinaryOption) -> tuple[float, float, float]:
-        """d(price) with respect to the rate and to each company's log value."""
-        cached: tuple[float, float, float] | None = self._sensitivity_cache.get(option.option_id)
+    def _factor_risk(self, option: BinaryOption) -> FactorRisk:
+        """Delta and gamma of `option` against the rate and each company's log value.
+
+        Central differences throughout: the down-bump needed for gamma makes the first
+        derivative second-order accurate for free. The rate leg degenerates at the zero floor,
+        where a down-bump is not available and the curvature is simply not observable.
+        """
+        cached: FactorRisk | None = self._sensitivity_cache.get(option.option_id)
         if cached is not None:
             return cached
 
@@ -845,42 +886,59 @@ class MarketMaker:
         base_price: float = self.price_option(option)
         step: float = self.parameters.rate_step
 
-        bumped: dict[int, float] = dict(base_values)
-        bumped[FED_FUNDS_RATE_UNDERLYING_ID] = max(base_values[FED_FUNDS_RATE_UNDERLYING_ID] + step, 0.0)
-        rate_sensitivity: float = (price_binary_option(self.parameters, option, bumped) - base_price) / step
+        def price_with(underlying_id: int, value: float) -> float:
+            bumped: dict[int, float] = dict(base_values)
+            bumped[underlying_id] = value
+            return price_binary_option(self.parameters, option, bumped)
 
-        company_sensitivities: list[float] = []
+        base_rate: float = base_values[FED_FUNDS_RATE_UNDERLYING_ID]
+        rate_down_value: float = max(base_rate - step, 0.0)
+        rate_up_price: float = price_with(FED_FUNDS_RATE_UNDERLYING_ID, base_rate + step)
+        if base_rate - rate_down_value > TOLERANCE:
+            rate_down_price: float = price_with(FED_FUNDS_RATE_UNDERLYING_ID, rate_down_value)
+            rate_delta: float = (rate_up_price - rate_down_price) / (2.0 * step)
+            rate_gamma: float = (rate_up_price - 2.0 * base_price + rate_down_price) / (step * step)
+        else:
+            rate_delta = (rate_up_price - base_price) / step
+            rate_gamma = 0.0
+
+        deltas: list[float] = [rate_delta]
+        gammas: list[float] = [rate_gamma]
         for company_id in COMPANY_UNDERLYING_IDS:
-            bumped = dict(base_values)
-            bumped[company_id] = base_values[company_id] * math.exp(0.01)
-            company_sensitivities.append(
-                (price_binary_option(self.parameters, option, bumped) - base_price) / 0.01
-            )
+            base_value: float = base_values[company_id]
+            up_price: float = price_with(company_id, base_value * math.exp(COMPANY_LOG_BUMP))
+            down_price: float = price_with(company_id, base_value * math.exp(-COMPANY_LOG_BUMP))
+            deltas.append((up_price - down_price) / (2.0 * COMPANY_LOG_BUMP))
+            gammas.append((up_price - 2.0 * base_price + down_price) / (COMPANY_LOG_BUMP**2))
 
-        sensitivity: tuple[float, float, float] = (
-            rate_sensitivity,
-            company_sensitivities[0],
-            company_sensitivities[1],
+        risk: FactorRisk = FactorRisk(
+            delta=(deltas[0], deltas[1], deltas[2]),
+            gamma=(gammas[0], gammas[1], gammas[2]),
         )
-        self._sensitivity_cache[option.option_id] = sensitivity
-        return sensitivity
+        self._sensitivity_cache[option.option_id] = risk
+        return risk
 
-    def _portfolio_exposure(self) -> tuple[float, float, float]:
+    def _portfolio_exposure(self) -> FactorRisk:
         if self._exposure is not None:
             return self._exposure
 
-        totals: list[float] = [0.0, 0.0, 0.0]
+        delta_totals: list[float] = [0.0, 0.0, 0.0]
+        gamma_totals: list[float] = [0.0, 0.0, 0.0]
         for option_id, quantity in self.position.option_quantity_by_option_id.items():
             if quantity == 0:
                 continue
             option: BinaryOption | None = self.contract_by_option_id.get(option_id)
             if option is None:
                 continue
-            sensitivity: tuple[float, float, float] = self._sensitivity(option)
+            risk: FactorRisk = self._factor_risk(option)
             for index in range(3):
-                totals[index] += quantity * sensitivity[index]
+                delta_totals[index] += quantity * risk.delta[index]
+                gamma_totals[index] += quantity * risk.gamma[index]
 
-        self._exposure = (totals[0], totals[1], totals[2])
+        self._exposure = FactorRisk(
+            delta=(delta_totals[0], delta_totals[1], delta_totals[2]),
+            gamma=(gamma_totals[0], gamma_totals[1], gamma_totals[2]),
+        )
         return self._exposure
 
     def portfolio_delta(self) -> tuple[float, float, float]:
@@ -890,7 +948,16 @@ class MarketMaker:
         against a short one, and nets AJR exposure held directly against AJR exposure held
         through a relative-value contract like AJR - THR >= 0.
         """
-        return self._portfolio_exposure()
+        return self._portfolio_exposure().delta
+
+    def portfolio_gamma(self) -> tuple[float, float, float]:
+        """The book's net convexity to the same three factors.
+
+        Delta-flat is not risk-flat here. Two binaries struck either side of spot can cancel in
+        `portfolio_delta` while both flipping the same way on a single move; that shows up here
+        and nowhere else.
+        """
+        return self._portfolio_exposure().gamma
 
     def _factor_variances(self) -> tuple[float, float, float]:
         up_probability, down_probability = self.parameters.rate_transition_probabilities(
@@ -910,14 +977,50 @@ class MarketMaker:
         eagerly, which pulls flow that flattens the book. Scaled by risk capital so the shift is
         expressed in probability (price) units rather than raw contract-deltas.
         """
-        sensitivity: tuple[float, float, float] = self._sensitivity(option)
-        exposure: tuple[float, float, float] = self.portfolio_delta()
+        risk: FactorRisk = self._factor_risk(option)
+        book: FactorRisk = self._portfolio_exposure()
         variances: tuple[float, float, float] = self._factor_variances()
         covariance: float = sum(
-            variances[index] * sensitivity[index] * exposure[index] for index in range(3)
+            variances[index] * risk.delta[index] * book.delta[index] for index in range(3)
         )
+        if self.GAMMA_ENABLED:
+            # Second-order term of Cov(f(X), g(X)) for Gaussian X: sum of f''g''*var^2 / 2. It
+            # survives when both books are delta-flat, which is exactly the pin-risk case the
+            # linear term scores as zero.
+            covariance += GAMMA_AVERSION * sum(
+                0.5 * variances[index] ** 2 * risk.gamma[index] * book.gamma[index]
+                for index in range(3)
+            )
         skew: float = INVENTORY_AVERSION * covariance / self.risk_capital
         return min(max(skew, -MAX_INVENTORY_SKEW), MAX_INVENTORY_SKEW)
+
+    def _convexity_charge(self, option: BinaryOption) -> float:
+        """Expected one-step move in theo that delta alone does not explain, in price units.
+
+        This is the half-gamma-variance term of the Taylor expansion, summed over factors with
+        absolute values: we are pricing the *magnitude* of the curvature we cannot skew away,
+        not its direction. Large for near-strike, near-expiry binaries and ~0 for everything
+        else, which is precisely where the delta snapshot used to quote goes stale fastest.
+        """
+        if not self.GAMMA_ENABLED:
+            return 0.0
+        risk: FactorRisk = self._factor_risk(option)
+        variances: tuple[float, float, float] = self._factor_variances()
+        return 0.5 * sum(variances[index] * abs(risk.gamma[index]) for index in range(3))
+
+    def _convexity_padding(self, option: BinaryOption) -> float:
+        """Extra half-spread charged for curvature, capped so we still quote the hot contracts."""
+        return min(GAMMA_PAD_AVERSION * self._convexity_charge(option), MAX_GAMMA_PAD)
+
+    def _convexity_size_factor(self, option: BinaryOption) -> float:
+        """Multiplier in (0, 1] on quoted size; halves at a convexity charge of one tolerance.
+
+        Widening alone does not cap the damage from a gamma contract, because the loss scales
+        with size while the pad is capped. Cutting size is the part that actually bounds it.
+        """
+        if not self.GAMMA_ENABLED:
+            return 1.0
+        return 1.0 / (1.0 + self._convexity_charge(option) / GAMMA_SIZE_TOLERANCE)
 
     def reservation_price(self, option: BinaryOption) -> float:
         """Theo adjusted for the delta we already hold -- the price we actually trade around.
@@ -973,7 +1076,11 @@ class MarketMaker:
         return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
 
     def quote(self, option: BinaryOption, counterparty_id: int) -> Quote:
-        padding: float = WINNER_CURSE_PAD + self._counterparty_padding(counterparty_id)
+        padding: float = (
+            WINNER_CURSE_PAD
+            + self._counterparty_padding(counterparty_id)
+            + self._convexity_padding(option)
+        )
         skew: float = self._inventory_skew(option)
         reservation: float = self.reservation_price(option)
 
@@ -983,6 +1090,12 @@ class MarketMaker:
         steps: int = option.steps_until_expiry
         bid_quantity: int = self._affordable_quantity(bid_price, steps)
         offer_quantity: int = self._affordable_quantity(1.0 - offer_price, steps)
+
+        # Curvature cuts both sides: unlike inventory skew this is not directional, it is a
+        # statement that our own delta snapshot is about to be wrong whichever way we get hit.
+        size_factor: float = self._convexity_size_factor(option)
+        bid_quantity = int(bid_quantity * size_factor)
+        offer_quantity = int(offer_quantity * size_factor)
 
         # Show size on the side that flattens the book, minimal size on the side that grows it.
         if skew > 0.0:
@@ -1008,16 +1121,24 @@ class MarketMaker:
 
     def respond_to_fok(self, option: BinaryOption, fok_order: FokOrder) -> bool:
         reservation: float = self.reservation_price(option)
-        required: float = FOK_EDGE_REQUIRED + self._counterparty_padding(fok_order.counterparty_id)
+        required: float = (
+            FOK_EDGE_REQUIRED
+            + self._counterparty_padding(fok_order.counterparty_id)
+            + self._convexity_padding(option)
+        )
 
         steps: int = option.steps_until_expiry
+        # A FOK arrives in one indivisible clip, so the convexity size cap matters more here
+        # than on a quote: there is no partial fill to stop us at a tolerable position.
+        size_limit: float = self._convexity_size_factor(option)
         counterparty_buys: bool = (fok_order.order_type == OrderType.BUY) == ORDER_TYPE_IS_COUNTERPARTY_SIDE
         if counterparty_buys:
             # We sell at fok_order.price; each contract locks (1 - price) of cash.
             if fok_order.price < reservation + required:
                 return False
-            return self._affordable_quantity(1.0 - fok_order.price, steps) >= fok_order.quantity
+            affordable: int = self._affordable_quantity(1.0 - fok_order.price, steps)
+            return int(affordable * size_limit) >= fok_order.quantity
 
         if fok_order.price > reservation - required:
             return False
-        return self._affordable_quantity(fok_order.price, steps) >= fok_order.quantity
+        return int(self._affordable_quantity(fok_order.price, steps) * size_limit) >= fok_order.quantity
