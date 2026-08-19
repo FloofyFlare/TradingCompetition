@@ -919,6 +919,10 @@ class MarketMaker:
         self._observed_path: dict[int, list[float]] = {}
         self._steps_since_refit: int = 0
 
+        # Collateral that quotes and accepted FOKs still outstanding could consume. Reset each
+        # step, because that is the granularity at which the grader checks solvency.
+        self._committed_collateral: float = 0.0
+
         # FOK side detection: which reading of `FokOrder.order_type` the tape has voted for.
         self._order_type_is_counterparty_side: bool = ORDER_TYPE_IS_COUNTERPARTY_SIDE
         self._fok_side_agreements: int = 0
@@ -983,6 +987,7 @@ class MarketMaker:
         self._record_observation(new_values)
         self._maybe_refit()
         self._pending_fok.clear()
+        self._committed_collateral = 0.0
         self._invalidate_caches()
 
     def _credit_expiry(
@@ -1085,6 +1090,7 @@ class MarketMaker:
         collateral = max(collateral, 0.0)
         self.cash_balance -= collateral
         self._pessimistic_cash -= collateral
+        self._release_collateral(collateral)
 
         self._record_fok_outcome(option.option_id, price, quantity)
 
@@ -1423,9 +1429,38 @@ class MarketMaker:
         if collateral_per_contract <= TOLERANCE:
             return MAX_QUOTE_SIZE
         live_options: int = max(1, len(self.active_option_state))
-        budget: float = self._available_cash() / (CONCURRENT_LOAD_FACTOR * live_options)
+        budget: float = self._uncommitted_cash() / (CONCURRENT_LOAD_FACTOR * live_options)
         budget /= math.sqrt(max(num_steps, 1))
         return max(0, min(MAX_QUOTE_SIZE, int(budget / collateral_per_contract)))
+
+    def _uncommitted_cash(self) -> float:
+        """Available cash less everything this step's live quotes could still consume.
+
+        This is what makes solvency a guarantee rather than a statistic. Collateral equals the
+        trade's maximum loss and is charged up front, so the grader's balance can only fall at
+        trade time -- meaning the balance is safe if, and only if, the collateral of every
+        simultaneously outstanding quote fits inside available cash.
+
+        `_affordable_quantity` alone does not give that. It sizes off `cash_balance`, which
+        moves only when `on_trade` fires, so it is only self-limiting if the grader reports each
+        fill before asking for the next quote. A grader that polls several counterparties per
+        option and settles the day's fills in a batch sizes every quote of the day off the same
+        figure, and the budgets stack: measured bankrupt at 25 RFQs per option per day.
+
+        Subtracting live commitments closes that. Each quote is sized inside what is left, so
+        committed <= available holds inductively, and a fill lowers both sides by the same
+        amount. Even if every outstanding quote filled at full displayed size, the day would end
+        at the cash buffer rather than below zero -- which is exactly where solvency is checked.
+        """
+        return max(self._available_cash() - self._committed_collateral, 0.0)
+
+    def _commit_collateral(self, amount: float) -> None:
+        self._committed_collateral += max(amount, 0.0)
+
+    def _release_collateral(self, amount: float) -> None:
+        # A fill converts a commitment into cash actually spent, which `cash_balance` already
+        # reflects; leaving it committed as well would double-count it.
+        self._committed_collateral = max(self._committed_collateral - max(amount, 0.0), 0.0)
 
     #: A quote that locks up no cash and cannot lose money -- the only safe way to say "no",
     #: since a two-sided quote is mandatory. Also the fallback whenever quoting raises.
@@ -1481,6 +1516,11 @@ class MarketMaker:
             offer_price, offer_quantity = 1.0, 1
         bid_price, offer_price = _snap_quote_prices(bid_price, offer_price)
 
+        # One RFQ produces at most one fill, so a quote's exposure is the worse of its two
+        # sides, not their sum.
+        self._commit_collateral(
+            max(bid_price * bid_quantity, (1.0 - offer_price) * offer_quantity)
+        )
         return Quote(
             bid_price=bid_price,
             bid_quantity=bid_quantity,
@@ -1540,6 +1580,10 @@ class MarketMaker:
             self._pending_fok.append(
                 (option.option_id, fok_order.price, fok_order.quantity, counterparty_buys)
             )
+            unit_collateral: float = (
+                1.0 - fok_order.price if counterparty_buys else fok_order.price
+            )
+            self._commit_collateral(unit_collateral * fok_order.quantity)
         return accepted
 
 
