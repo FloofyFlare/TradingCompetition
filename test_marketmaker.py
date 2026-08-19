@@ -1,12 +1,16 @@
 """Validation harness for the market maker.
 
-Three checks, in increasing order of what they prove:
+Four checks, in increasing order of what they prove:
 
 1. `check_pricer`      -- prices from `price_option_from_parameters` against a Monte Carlo of
                           the real `MarketParameters.advance_step`. This is ground truth.
-2. `check_estimator`   -- parameters recovered from a warm-up history, priced against the
+2. `check_continuity`  -- the price surface has no jumps along the axes the greeks
+                          differentiate, and the rate bump still matches the lattice spacing.
+                          Gamma is a second difference, so a jump inside a bump window becomes
+                          a spurious gamma of order (jump / bump^2) and slams the size caps.
+3. `check_estimator`   -- parameters recovered from a warm-up history, priced against the
                           truth, so estimation error shows up in price units.
-3. `check_solvency`    -- a full session against maximally toxic counterparties, asserting
+4. `check_solvency`    -- a full session against maximally toxic counterparties, asserting
                           cash never goes negative and that our own ledger matches the
                           grader's collateral rule exactly.
 
@@ -17,6 +21,8 @@ import math
 import random
 import sys
 
+from dataclasses import replace
+
 from marketmaker import (
     AJARAI_NAME,
     AJARAI_UNDERLYING_ID,
@@ -25,6 +31,7 @@ from marketmaker import (
     THERIODIC_NAME,
     THERIODIC_UNDERLYING_ID,
     BinaryOption,
+    FittedParameters,
     FokOrder,
     MarketHistory,
     MarketMaker,
@@ -141,7 +148,134 @@ def check_pricer(num_paths: int = 20000, seed: int = 7) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------
-# 2. Estimator quality, measured in price units
+# 2. Continuity of the price surface along the axes the greeks differentiate
+# ---------------------------------------------------------------------------------------------
+
+
+CONTINUITY_PARAMETERS: FittedParameters = FittedParameters(
+    rate_step=0.25,
+    rate_intercept_up=0.50,
+    rate_slope=-0.10,
+    rate_intercept_down=0.10,
+    drift_by_id={AJARAI_UNDERLYING_ID: 0.004, THERIODIC_UNDERLYING_ID: 0.002},
+    rate_beta_by_id={AJARAI_UNDERLYING_ID: -0.30, THERIODIC_UNDERLYING_ID: -0.25},
+    covariance={
+        (AJARAI_UNDERLYING_ID, AJARAI_UNDERLYING_ID): 0.010,
+        (THERIODIC_UNDERLYING_ID, THERIODIC_UNDERLYING_ID): 0.012,
+        (AJARAI_UNDERLYING_ID, THERIODIC_UNDERLYING_ID): 0.004,
+    },
+)
+
+
+def _largest_step(price_at, low: float, high: float, num_points: int) -> float:
+    prices: list[float] = [price_at(low + (high - low) * i / num_points) for i in range(num_points + 1)]
+    return max(abs(prices[i + 1] - prices[i]) for i in range(num_points))
+
+
+def _halving_ratio(price_at, low: float, high: float, num_points: int = 300) -> float:
+    """Largest successive price change at spacing h, divided by the same at h/2.
+
+    A continuous function's largest step halves when the grid halves, giving ~2. Across a
+    genuine discontinuity the step is the jump itself and does not shrink, giving ~1. This
+    separates "discontinuous" from merely "steep" without needing a magnitude threshold.
+    """
+    coarse: float = _largest_step(price_at, low, high, num_points)
+    fine: float = _largest_step(price_at, low, high, num_points * 2)
+    return coarse / fine if fine > 1e-15 else float("inf")
+
+
+def check_continuity() -> bool:
+    values: dict[int, float] = dict(INITIAL_VALUES)
+    ajarai_leg = (OptionLeg(AJARAI_UNDERLYING_ID, 1.0),)
+    spread_legs = (OptionLeg(AJARAI_UNDERLYING_ID, 1.0), OptionLeg(THERIODIC_UNDERLYING_ID, -1.0))
+    basket_legs = (OptionLeg(AJARAI_UNDERLYING_ID, 1.0), OptionLeg(THERIODIC_UNDERLYING_ID, 1.0))
+
+    def price(legs, steps: int, strike: float, overrides: dict[int, float] | None = None) -> float:
+        merged: dict[int, float] = dict(values)
+        if overrides:
+            merged.update(overrides)
+        return price_binary_option(
+            CONTINUITY_PARAMETERS,
+            BinaryOption(legs=legs, option_id=1, steps_until_expiry=steps, strike=strike),
+            merged,
+        )
+
+    print("\n[2] price surface continuity (halving ratio ~2 continuous, ~1 discontinuous)")
+    passed: bool = True
+
+    # The rate axis is a discrete lattice and is *expected* to jump, so it is excluded here and
+    # guarded separately below. These three axes must be smooth or the greeks are meaningless.
+    cases: list[tuple[str, object]] = [
+        ("AJR>=525 vs AJR", lambda x: price(ajarai_leg, 5, 525.0, {AJARAI_UNDERLYING_ID: x})),
+        ("AJR-THR>=0 vs AJR", lambda x: price(spread_legs, 5, 0.0, {AJARAI_UNDERLYING_ID: x})),
+        ("AJR+THR>=950 vs AJR", lambda x: price(basket_legs, 5, 950.0, {AJARAI_UNDERLYING_ID: x})),
+    ]
+    for label, function in cases:
+        ratio: float = _halving_ratio(function, 400.0, 600.0)
+        ok: bool = ratio > 1.6
+        passed = passed and ok
+        print(f"    {label:<34} ratio {ratio:>5.2f}   {'ok' if ok else 'JUMP'}")
+
+    for label, legs, strike, low, high in (
+        ("AJR vs strike", ajarai_leg, 0.0, 400.0, 600.0),
+        ("AJR+THR vs strike", basket_legs, 0.0, 850.0, 1050.0),
+    ):
+        ratio = _halving_ratio(lambda k, l=legs: price(l, 5, k), low, high)
+        ok = ratio > 1.6
+        passed = passed and ok
+        print(f"    {label:<34} ratio {ratio:>5.2f}   {'ok' if ok else 'JUMP'}")
+
+    def scaled(legs, factor: float) -> float:
+        parameters = replace(
+            CONTINUITY_PARAMETERS,
+            covariance={k: v * factor for k, v in CONTINUITY_PARAMETERS.covariance.items()},
+        )
+        return price_binary_option(
+            parameters, BinaryOption(legs=legs, option_id=1, steps_until_expiry=5, strike=525.0), values
+        )
+
+    ratio = _halving_ratio(lambda f: scaled(ajarai_leg, f), 0.2, 3.0)
+    ok = ratio > 1.6
+    passed = passed and ok
+    print(f"    {'AJR>=525 vs covariance scale':<34} ratio {ratio:>5.2f}   {'ok' if ok else 'JUMP'}")
+
+    # `_conditional_company_probability` swaps to a closed-form ratio when an opposite-weight
+    # pair meets |strike| < TOLERANCE. The two branches must meet, or every relative-value
+    # contract is mispriced by the seam width.
+    worst_seam: float = 0.0
+    for steps in (1, 3, 10, 30):
+        closed: float = price(spread_legs, steps, 0.0)
+        for epsilon in (1e-12, 1e-9, 1e-8):
+            worst_seam = max(worst_seam, abs(price(spread_legs, steps, epsilon) - closed))
+    seam_ok: bool = worst_seam < 1e-9
+    passed = passed and seam_ok
+    print(f"    {'closed-form / quadrature seam':<34} gap   {worst_seam:.1e}   {'ok' if seam_ok else 'SEAM'}")
+
+    # The rate lattice really is discontinuous, so rate gamma is only meaningful because
+    # `_factor_risk` bumps by exactly `parameters.rate_step` and lands on adjacent nodes. Shrink
+    # that bump and gamma explodes (or silently reads zero inside one cell). This guards the
+    # invariant: measured rate gamma must stay bounded.
+    worst_gamma: float = 0.0
+    for steps in (1, 3, 10):
+        for rate in (2.5, 2.75, 3.0, 3.25, 3.5):
+            option = BinaryOption(
+                legs=(OptionLeg(FED_FUNDS_RATE_UNDERLYING_ID, 1.0),),
+                option_id=1, steps_until_expiry=steps, strike=3.25,
+            )
+            local: dict[int, float] = dict(values)
+            local[FED_FUNDS_RATE_UNDERLYING_ID] = rate
+            maker = MarketMaker(underlying_state(local), [option], 1000.0)
+            maker.parameters = CONTINUITY_PARAMETERS
+            worst_gamma = max(worst_gamma, abs(maker._factor_risk(option).gamma[0]))
+    gamma_ok: bool = worst_gamma < 50.0
+    passed = passed and gamma_ok
+    print(f"    {'rate gamma bounded (bump=lattice)':<34} max   {worst_gamma:>5.2f}   {'ok' if gamma_ok else 'BLOWN'}")
+
+    return passed
+
+
+# ---------------------------------------------------------------------------------------------
+# 3. Estimator quality, measured in price units
 # ---------------------------------------------------------------------------------------------
 
 
@@ -169,13 +303,13 @@ def check_estimator(num_trials: int = 12, warm_up_days: int = 400, seed: int = 1
             count += 1
 
     mean_error: float = total / count
-    print("\n[2] estimator (warm-up history -> price error vs truth)")
+    print("\n[3] estimator (warm-up history -> price error vs truth)")
     print(f"    mean abs error {mean_error:.4f}   worst {worst:.4f}   ({count} prices)")
     return mean_error < 0.030 and worst < 0.20
 
 
 # ---------------------------------------------------------------------------------------------
-# 3. Solvency under maximally toxic flow
+# 4. Solvency under maximally toxic flow
 # ---------------------------------------------------------------------------------------------
 
 
@@ -293,7 +427,7 @@ class Exchange:
 def check_solvency(num_scenarios: int = 8, num_days: int = 60, seed: int = 23) -> bool:
     rng = random.Random(seed)
     random.seed(seed)
-    print("\n[3] solvency under toxic flow (start cash 100.00)")
+    print("\n[4] solvency under toxic flow (start cash 100.00)")
     print(f"    {'toxicity':>9} {'scenario':>9} {'min cash':>10} {'end cash':>10} {'trades':>7} {'ledger':>9}")
     passed: bool = True
 
@@ -321,6 +455,7 @@ def check_solvency(num_scenarios: int = 8, num_days: int = 60, seed: int = 23) -
 if __name__ == "__main__":
     results: list[tuple[str, bool]] = [
         ("pricer", check_pricer()),
+        ("continuity", check_continuity()),
         ("estimator", check_estimator()),
         ("solvency", check_solvency()),
     ]
