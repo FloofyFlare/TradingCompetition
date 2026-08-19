@@ -3,6 +3,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any, Final
 
 AJARAI_NAME: Final[str] = "AJR"
@@ -288,6 +289,23 @@ GAMMA_SIZE_TOLERANCE: Final[float] = 0.02
 # the second difference resolves real curvature rather than the shape of the whole distribution.
 COMPANY_LOG_BUMP: Final[float] = 0.01
 
+# Vega knobs. Unlike delta and gamma this is not a risk we carry, it is a measure of how wrong
+# our own theo can be: `covariance` is the one fitted parameter that never passes through
+# `_shrink_towards_zero`, so a thin or unlucky warm-up feeds the pricer a vol level we have no
+# right to trust. `VOL_RELATIVE_UNCERTAINTY` is the relative standard error of a sample
+# covariance, ~sqrt(2/N) for N residuals, so |vega| * that is the price error one sigma of
+# estimation noise buys us.
+# Measured worth on top of gamma: +4.6 PnL against uninformed flow, +1.6 at half toxicity,
+# nil against fully informed flow. Small next to gamma's +37/+28/+6, but consistent (70/80 and
+# 64/80 paired wins). It is not redundant with gamma despite a +0.56 charge correlation: gamma
+# blows up as 1/sigma^2 and so only ever flags short-dated contracts, while vega stays bounded
+# and catches the long-dated ones, where n steps of compounding make a covariance error worst.
+VOL_RELATIVE_UNCERTAINTY: Final[float] = 0.10
+COVARIANCE_BUMP: Final[float] = 0.10
+VEGA_PAD_AVERSION: Final[float] = 1.0
+MAX_VEGA_PAD: Final[float] = 0.04
+VEGA_SIZE_TOLERANCE: Final[float] = 0.005
+
 # Collateral is only returned at expiry, so the book's peak usage is roughly
 # (fills per step) x (collateral per fill) x (steps held). Budgeting each quote against the
 # number of live options keeps that product under the bankroll.
@@ -435,24 +453,57 @@ def fitted_from_market_parameters(market_parameters: MarketParameters) -> Fitted
     )
 
 
-def terminal_rate_distribution(
-    parameters: FittedParameters, initial_rate: float, num_steps: int
-) -> dict[float, float]:
-    """Exact distribution of the rate after `num_steps`, by forward DP over the 0.25 grid."""
+@lru_cache(maxsize=8192)
+def _terminal_rate_distribution(
+    rate_step: float,
+    rate_intercept_up: float,
+    rate_slope: float,
+    rate_intercept_down: float,
+    initial_rate: float,
+    num_steps: int,
+) -> tuple[tuple[float, float], ...]:
+    """Forward DP over the 0.25 grid, keyed only on what the rate chain actually depends on.
+
+    Split out from `terminal_rate_distribution` and memoized because the greeks reprice the
+    same option 9 times, and 8 of those bumps move a company value or the covariance -- neither
+    of which touches this DP. Keyed on the four chain scalars rather than the parameters object
+    so a `replace`-d copy carrying a bumped covariance still hits.
+
+    Returns an immutable tuple: the result is shared between callers and must not be mutated.
+    """
     distribution: dict[float, float] = {initial_rate: 1.0}
     for _ in range(num_steps):
         updated: dict[float, float] = defaultdict(float)
         for rate_value, probability in distribution.items():
-            up_probability, down_probability = parameters.rate_transition_probabilities(rate_value)
+            up_probability: float = min(max(rate_intercept_up + rate_slope * rate_value, 0.0), 1.0)
+            down_probability: float = min(
+                max(rate_intercept_down - rate_slope * rate_value, 0.0), 1.0 - up_probability
+            )
             stay_probability: float = max(0.0, 1.0 - up_probability - down_probability)
             if up_probability > 0.0:
-                updated[parameters.next_rate_value(rate_value, 1)] += probability * up_probability
+                updated[max(round(rate_value + rate_step, 2), 0.0)] += probability * up_probability
             if down_probability > 0.0:
-                updated[parameters.next_rate_value(rate_value, -1)] += probability * down_probability
+                updated[max(round(rate_value - rate_step, 2), 0.0)] += probability * down_probability
             if stay_probability > 0.0:
                 updated[rate_value] += probability * stay_probability
         distribution = dict(updated)
-    return distribution
+    return tuple(distribution.items())
+
+
+def terminal_rate_distribution(
+    parameters: FittedParameters, initial_rate: float, num_steps: int
+) -> dict[float, float]:
+    """Exact distribution of the rate after `num_steps`, by forward DP over the 0.25 grid."""
+    return dict(
+        _terminal_rate_distribution(
+            parameters.rate_step,
+            parameters.rate_intercept_up,
+            parameters.rate_slope,
+            parameters.rate_intercept_down,
+            initial_rate,
+            num_steps,
+        )
+    )
 
 
 def _weighted_lognormal_at_least(
@@ -569,19 +620,26 @@ def price_binary_option(
     weight_by_id: dict[int, float] = {leg.underlying_id: leg.weight for leg in option.legs}
     rate_weight: float = weight_by_id.pop(FED_FUNDS_RATE_UNDERLYING_ID, 0.0)
     initial_rate: float = value_by_underlying_id[FED_FUNDS_RATE_UNDERLYING_ID]
-    distribution: dict[float, float] = terminal_rate_distribution(
-        parameters, initial_rate, option.steps_until_expiry
+    # The memoized tuple form, not the dict wrapper: this is the hot path and the greeks call
+    # it nine times per option with an identical rate chain.
+    distribution: tuple[tuple[float, float], ...] = _terminal_rate_distribution(
+        parameters.rate_step,
+        parameters.rate_intercept_up,
+        parameters.rate_slope,
+        parameters.rate_intercept_down,
+        initial_rate,
+        option.steps_until_expiry,
     )
 
     if not weight_by_id:
         return sum(
             probability
-            for rate_value, probability in distribution.items()
+            for rate_value, probability in distribution
             if rate_weight * rate_value >= option.strike - TOLERANCE
         )
 
     total: float = 0.0
-    for rate_value, probability in distribution.items():
+    for rate_value, probability in distribution:
         if probability <= 0.0:
             continue
         total += probability * _conditional_company_probability(
@@ -757,16 +815,22 @@ class FactorRisk:
     Ordered (rate, log AJR, log THR). `delta` is per unit move in the factor; `gamma` is per
     unit move squared. Both are additive across a book, so the same type carries a single
     option's risk and the whole portfolio's.
+
+    `vega` is a single scalar rather than a triple: it is the derivative with respect to a
+    proportional scaling of the whole company covariance matrix, which keeps correlations fixed
+    and moves only the vol level. That is the shape our estimation error actually takes.
     """
 
     delta: tuple[float, float, float]
     gamma: tuple[float, float, float]
+    vega: float = 0.0
 
 
 class MarketMaker:
     # Set False to A/B the convexity layer against the delta-only book. Every gamma-aware
     # adjustment below collapses to its previous behaviour when this is off.
     GAMMA_ENABLED: bool = True
+    VEGA_ENABLED: bool = True
 
     def __init__(
         self,
@@ -914,9 +978,30 @@ class MarketMaker:
         risk: FactorRisk = FactorRisk(
             delta=(deltas[0], deltas[1], deltas[2]),
             gamma=(gammas[0], gammas[1], gammas[2]),
+            vega=self._vega(option, base_values),
         )
         self._sensitivity_cache[option.option_id] = risk
         return risk
+
+    def _vega(self, option: BinaryOption, base_values: dict[int, float]) -> float:
+        """d(price) with respect to a proportional scaling of the company covariance matrix.
+
+        Zero by construction for rate-only contracts, which is worth short-circuiting: they are
+        a large share of the board and the two repricings would be pure waste.
+        """
+        if not any(leg.underlying_id in COMPANY_UNDERLYING_IDS for leg in option.legs):
+            return 0.0
+
+        def scaled_price(factor: float) -> float:
+            scaled: FittedParameters = replace(
+                self.parameters,
+                covariance={key: value * factor for key, value in self.parameters.covariance.items()},
+            )
+            return price_binary_option(scaled, option, base_values)
+
+        return (scaled_price(1.0 + COVARIANCE_BUMP) - scaled_price(1.0 - COVARIANCE_BUMP)) / (
+            2.0 * COVARIANCE_BUMP
+        )
 
     def _portfolio_exposure(self) -> FactorRisk:
         if self._exposure is not None:
@@ -924,6 +1009,7 @@ class MarketMaker:
 
         delta_totals: list[float] = [0.0, 0.0, 0.0]
         gamma_totals: list[float] = [0.0, 0.0, 0.0]
+        vega_total: float = 0.0
         for option_id, quantity in self.position.option_quantity_by_option_id.items():
             if quantity == 0:
                 continue
@@ -931,6 +1017,7 @@ class MarketMaker:
             if option is None:
                 continue
             risk: FactorRisk = self._factor_risk(option)
+            vega_total += quantity * risk.vega
             for index in range(3):
                 delta_totals[index] += quantity * risk.delta[index]
                 gamma_totals[index] += quantity * risk.gamma[index]
@@ -938,6 +1025,7 @@ class MarketMaker:
         self._exposure = FactorRisk(
             delta=(delta_totals[0], delta_totals[1], delta_totals[2]),
             gamma=(gamma_totals[0], gamma_totals[1], gamma_totals[2]),
+            vega=vega_total,
         )
         return self._exposure
 
@@ -958,6 +1046,14 @@ class MarketMaker:
         and nowhere else.
         """
         return self._portfolio_exposure().gamma
+
+    def portfolio_vega(self) -> float:
+        """Net sensitivity to the fitted vol level, in price units per unit relative change.
+
+        Unhedgeable here, so this is a diagnostic: a large absolute value means the book's mark
+        is largely a statement about our covariance estimate rather than about the market.
+        """
+        return self._portfolio_exposure().vega
 
     def _factor_variances(self) -> tuple[float, float, float]:
         up_probability, down_probability = self.parameters.rate_transition_probabilities(
@@ -1011,6 +1107,24 @@ class MarketMaker:
     def _convexity_padding(self, option: BinaryOption) -> float:
         """Extra half-spread charged for curvature, capped so we still quote the hot contracts."""
         return min(GAMMA_PAD_AVERSION * self._convexity_charge(option), MAX_GAMMA_PAD)
+
+    def _vol_uncertainty_charge(self, option: BinaryOption) -> float:
+        """How far our theo moves if the fitted vol level is off by one standard error.
+
+        This is a confidence measure, not an exposure: there is no vol instrument here, so vega
+        cannot be hedged or skewed away. The only sane responses are to widen and to shrink.
+        """
+        if not self.VEGA_ENABLED:
+            return 0.0
+        return abs(self._factor_risk(option).vega) * VOL_RELATIVE_UNCERTAINTY
+
+    def _vol_uncertainty_padding(self, option: BinaryOption) -> float:
+        return min(VEGA_PAD_AVERSION * self._vol_uncertainty_charge(option), MAX_VEGA_PAD)
+
+    def _vol_uncertainty_size_factor(self, option: BinaryOption) -> float:
+        if not self.VEGA_ENABLED:
+            return 1.0
+        return 1.0 / (1.0 + self._vol_uncertainty_charge(option) / VEGA_SIZE_TOLERANCE)
 
     def _convexity_size_factor(self, option: BinaryOption) -> float:
         """Multiplier in (0, 1] on quoted size; halves at a convexity charge of one tolerance.
@@ -1080,6 +1194,7 @@ class MarketMaker:
             WINNER_CURSE_PAD
             + self._counterparty_padding(counterparty_id)
             + self._convexity_padding(option)
+            + self._vol_uncertainty_padding(option)
         )
         skew: float = self._inventory_skew(option)
         reservation: float = self.reservation_price(option)
@@ -1093,7 +1208,7 @@ class MarketMaker:
 
         # Curvature cuts both sides: unlike inventory skew this is not directional, it is a
         # statement that our own delta snapshot is about to be wrong whichever way we get hit.
-        size_factor: float = self._convexity_size_factor(option)
+        size_factor: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
         bid_quantity = int(bid_quantity * size_factor)
         offer_quantity = int(offer_quantity * size_factor)
 
@@ -1125,12 +1240,13 @@ class MarketMaker:
             FOK_EDGE_REQUIRED
             + self._counterparty_padding(fok_order.counterparty_id)
             + self._convexity_padding(option)
+            + self._vol_uncertainty_padding(option)
         )
 
         steps: int = option.steps_until_expiry
         # A FOK arrives in one indivisible clip, so the convexity size cap matters more here
         # than on a quote: there is no partial fill to stop us at a tolerable position.
-        size_limit: float = self._convexity_size_factor(option)
+        size_limit: float = self._convexity_size_factor(option) * self._vol_uncertainty_size_factor(option)
         counterparty_buys: bool = (fok_order.order_type == OrderType.BUY) == ORDER_TYPE_IS_COUNTERPARTY_SIDE
         if counterparty_buys:
             # We sell at fok_order.price; each contract locks (1 - price) of cash.
