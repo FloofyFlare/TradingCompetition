@@ -207,6 +207,7 @@ INVENTORY_AVERSION = 1.5
 MAX_INVENTORY_SKEW = 0.25
 MAX_QUOTE_SIZE = 40
 MIN_LOSS_PROBABILITY = 0.05
+REPEAT_FILL_ALLOWANCE = 3.0
 TARGET_FILL_RATE = 0.35
 GENEROSITY_AVERSION = 0.2
 MAX_GENEROSITY_PAD = 0.05
@@ -567,7 +568,14 @@ class MarketMaker:
         surviving_ids = {option.option_id for option in new_option_state}
         tracked_ids = set(self.contract_by_option_id) | set(self.gross_long_by_option_id) | set(self.gross_short_by_option_id)
         for option_id in tracked_ids - surviving_ids:
-            option = self.contract_by_option_id.pop(option_id, None)
+            option = self.contract_by_option_id.get(option_id)
+            if option is not None and option.steps_until_expiry > 1:
+                self.contract_by_option_id.pop(option_id, None)
+                self.gross_long_by_option_id.pop(option_id, None)
+                self.gross_short_by_option_id.pop(option_id, None)
+                self.position.option_quantity_by_option_id.pop(option_id, None)
+                continue
+            self.contract_by_option_id.pop(option_id, None)
             long_quantity = self.gross_long_by_option_id.pop(option_id, 0)
             short_quantity = self.gross_short_by_option_id.pop(option_id, 0)
             self.position.option_quantity_by_option_id.pop(option_id, None)
@@ -869,7 +877,7 @@ class MarketMaker:
         budget /= math.sqrt(max(num_steps, 1))
         effective_cost = collateral_per_contract * min(max(loss_probability, MIN_LOSS_PROBABILITY), 1.0)
         by_risk = int(budget / effective_cost)
-        by_cash = int(uncommitted / collateral_per_contract)
+        by_cash = int(uncommitted / (collateral_per_contract * REPEAT_FILL_ALLOWANCE))
         return max(0, min(MAX_QUOTE_SIZE, by_risk, by_cash))
 
     def _uncommitted_cash(self):
