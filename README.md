@@ -1,5 +1,3 @@
-I’ll inspect the repository structure and existing files, then add a polished README based on the project itself.I found a competition-focused Python repository with a primary implementation in `marketmaker.py`, a local validation harness, and several experimental/result artifacts. I’ll write the README to explain the project and usage without overstating results.# Akuna
-
 A Python implementation of a quantitative market-making bot for the 2026 Akuna Capital Virtual Quant Trading Challenge.
 
 The bot prices binary options, estimates market parameters, manages inventory and collateral, and produces two-sided quotes for the exchange.
