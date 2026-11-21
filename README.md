@@ -1,4 +1,4 @@
-A Python implementation of a quantitative market-making bot for the 2026 Akuna Capital Virtual Quant Trading Challenge.
+A Python implementation of a quantitative market-making bot for a 2026 Virtual Quant Trading Challenge.
 
 The bot prices binary options, estimates market parameters, manages inventory and collateral, and produces two-sided quotes for the exchange.
 
